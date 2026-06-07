@@ -296,6 +296,86 @@
       border-top: 1px solid var(--bdr2);
     }
 
+    /* ── Light mode ─────────────────────────────────────────── */
+    body.light {
+      --bg:   #F5F0E8; --surf:  #EDE8D6; --card:  #F8F4EC; --card2: #EDE9D8;
+      --bdr:  #D4CCAA; --bdr2: #E0D9C0; --text:  #1A1410; --muted: #7A7060;
+      --green:#1A8040; --red:  #8A1010;
+    }
+
+    /* ── Theme toggle ───────────────────────────────────────── */
+    .theme-btn {
+      background: none; border: 1px solid var(--bdr); color: var(--muted);
+      width: 32px; height: 32px; cursor: pointer; font-size: 15px;
+      transition: border-color .2s, color .2s;
+    }
+    .theme-btn:hover { border-color: var(--gold); color: var(--gold); }
+
+    /* ── Out of stock ───────────────────────────────────────── */
+    .oos-overlay {
+      position: absolute; inset: 0;
+      background: rgba(0,0,0,.62);
+      display: flex; align-items: center; justify-content: center;
+    }
+    .oos-label {
+      color: #FF5555; font-size: .58rem; font-weight: 700;
+      letter-spacing: .28em; text-transform: uppercase;
+      border: 1px solid #FF5555; padding: 4px 12px;
+    }
+    .add-btn:disabled { opacity: .35; cursor: not-allowed; }
+    .add-btn:disabled:hover { background: transparent; color: var(--gold); border-color: rgba(201,168,76,.5); }
+
+    /* ── Sale price ─────────────────────────────────────────── */
+    .prod-price-orig {
+      text-decoration: line-through;
+      color: var(--muted); font-size: .78rem;
+      font-family: 'Lato', sans-serif; margin-top: 1px;
+    }
+    .prod-price-sale {
+      font-family: 'Playfair Display', serif;
+      font-size: 1.05rem; font-weight: 700; color: #E05050;
+    }
+
+    /* ── Customer dialog ────────────────────────────────────── */
+    .customer-overlay {
+      position: fixed; inset: 0; background: rgba(0,0,0,.78);
+      backdrop-filter: blur(6px); z-index: 300;
+      display: none; align-items: center; justify-content: center;
+    }
+    .customer-overlay.open { display: flex; }
+    .customer-dialog {
+      background: var(--card2); border: 1px solid var(--bdr);
+      padding: 32px 28px; max-width: 380px; width: 90%;
+    }
+    .customer-dialog h3 {
+      font-family: 'Playfair Display', serif;
+      font-size: 1.05rem; font-weight: 400;
+      letter-spacing: .15em; text-transform: uppercase;
+      color: var(--gold); margin-bottom: 20px;
+    }
+    .customer-input {
+      width: 100%; background: var(--card); border: 1px solid var(--bdr);
+      color: var(--text); padding: 10px 14px;
+      font-size: .85rem; font-family: 'Lato', sans-serif;
+      outline: none; transition: border-color .2s; margin-bottom: 12px;
+    }
+    .customer-input:focus { border-color: var(--gold); }
+    .customer-input::placeholder { color: var(--muted); }
+    .customer-btns { display: flex; gap: 10px; margin-top: 4px; }
+    .customer-confirm {
+      flex: 1; background: linear-gradient(135deg, var(--gold-dk), var(--gold));
+      color: var(--bg); border: none; padding: 12px;
+      font-size: .72rem; font-weight: 700; letter-spacing: .16em; text-transform: uppercase;
+      cursor: pointer; font-family: 'Lato', sans-serif; transition: opacity .2s;
+    }
+    .customer-confirm:hover { opacity: .88; }
+    .customer-cancel {
+      background: none; border: 1px solid var(--bdr); color: var(--muted);
+      padding: 12px 18px; font-size: .72rem; letter-spacing: .1em; text-transform: uppercase;
+      cursor: pointer; font-family: 'Lato', sans-serif; transition: border-color .2s, color .2s;
+    }
+    .customer-cancel:hover { border-color: var(--gold); color: var(--gold); }
+
     @media (max-width: 600px) {
       .header-inner { padding: 12px 16px; }
       .logo-name { font-size: 1.2rem; }
@@ -320,6 +400,7 @@
         <div class="ws-dot" id="wsDot"></div>
         <span class="ws-label" id="wsLabel">Conectando…</span>
       </div>
+      <button class="theme-btn" id="themeBtn" onclick="toggleTheme()" title="Modo claro / oscuro">☀️</button>
       <button class="cart-toggle" onclick="toggleCart()">
         <span>🛍</span><span>Carrito</span>
         <span class="cart-count" id="cartCount">0</span>
@@ -375,6 +456,19 @@
       <button class="order-btn" onclick="placeOrder()">
         Hacer Pedido por WhatsApp &nbsp;→
       </button>
+    </div>
+  </div>
+</div>
+
+<!-- ── Customer dialog ─────────────────────────────────────── -->
+<div class="customer-overlay" id="customerOverlay">
+  <div class="customer-dialog">
+    <h3>Confirmar Pedido</h3>
+    <input class="customer-input" id="customerName" type="text" placeholder="Tu nombre *" autocomplete="name">
+    <input class="customer-input" id="customerPhone" type="tel" placeholder="Tu teléfono (opcional)" autocomplete="tel">
+    <div class="customer-btns">
+      <button class="customer-cancel" onclick="closeCustomerDialog()">Cancelar</button>
+      <button class="customer-confirm" onclick="confirmOrder()">Ordenar por WhatsApp →</button>
     </div>
   </div>
 </div>
@@ -475,15 +569,27 @@
       return;
     }
     grid.innerHTML = list.map(p => {
+      const oos  = p.inStock === false;
       const imgH = p.image
         ? `<img src="${p.image}" alt="${p.name}" class="prod-img" loading="lazy">`
         : `<span class="prod-emoji">${p.icon||'🌹'}</span>`;
+      const oosH = oos
+        ? `<div class="oos-overlay"><div class="oos-label">Agotado</div></div>`
+        : '';
+      const priceH = p.salePrice
+        ? `<div class="prod-price-sale">${CURRENCY}${Number(p.salePrice).toLocaleString('es-CO')}</div>
+           <div class="prod-price-orig">${CURRENCY}${Number(p.price).toLocaleString('es-CO')}</div>`
+        : `<div class="prod-price">${CURRENCY}${Number(p.price).toLocaleString('es-CO')}</div>`;
+      const btnH = oos
+        ? `<button class="add-btn" disabled>Agotado</button>`
+        : `<button class="add-btn" onclick="addToCart(${p.id})">Agregar</button>`;
       return `
       <div class="product-card">
         <div class="prod-img-wrap">
           ${imgH}
           ${p.badge?`<div class="prod-badge">${p.badge}</div>`:''}
           ${p.brand?`<div class="prod-brand-tag">${p.brand}</div>`:''}
+          ${oosH}
         </div>
         <div class="prod-info">
           <div class="prod-name">${p.name}</div>
@@ -491,10 +597,10 @@
         </div>
         <div class="prod-footer">
           <div>
-            <div class="prod-price">${CURRENCY}${Number(p.price).toLocaleString('es-CO')}</div>
+            ${priceH}
             <div class="prod-size">${p.size||''}</div>
           </div>
-          <button class="add-btn" onclick="addToCart(${p.id})">Agregar</button>
+          ${btnH}
         </div>
       </div>`;
     }).join('');
@@ -504,7 +610,7 @@
   let cart = {};
 
   function addToCart(id) {
-    const p = products.find(x=>x.id===id); if(!p) return;
+    const p = products.find(x=>x.id===id); if(!p||p.inStock===false) return;
     cart[id] = (cart[id]||0)+1;
     updateCartUI();
     const btn = event.target;
@@ -518,7 +624,8 @@
 
   function updateCartUI() {
     const total = Object.entries(cart).reduce((s,[id,q])=>{
-      const p=products.find(x=>x.id==id); return s+(p?p.price*q:0);
+      const p=products.find(x=>x.id==id);
+      return s+(p?(p.salePrice||p.price)*q:0);
     },0);
     const count = Object.values(cart).reduce((a,b)=>a+b,0);
     const cntEl = document.getElementById('cartCount');
@@ -541,7 +648,7 @@
           <div class="ci-name">${p.name} <small style="color:var(--muted)">×${qty}</small></div>
           <div class="ci-detail">${p.size||''}${p.brand?' · '+p.brand:''}</div>
         </div>
-        <div class="ci-price">${CURRENCY}${(p.price*qty).toLocaleString('es-CO')}</div>
+        <div class="ci-price">${CURRENCY}${((p.salePrice||p.price)*qty).toLocaleString('es-CO')}</div>
         <button class="ci-del" onclick="removeFromCart(${id})">×</button>
       </div>`;
     }).join('');
@@ -557,17 +664,43 @@
   /* ── WhatsApp order ──────────────────────────────────────── */
   function placeOrder() {
     if(!Object.keys(cart).length) return;
+    document.getElementById('customerOverlay').classList.add('open');
+    setTimeout(()=>document.getElementById('customerName').focus(), 100);
+  }
+
+  function closeCustomerDialog() {
+    document.getElementById('customerOverlay').classList.remove('open');
+  }
+
+  function confirmOrder() {
+    const name  = document.getElementById('customerName').value.trim();
+    const phone = document.getElementById('customerPhone').value.trim();
+    if (!name) { document.getElementById('customerName').focus(); return; }
+    closeCustomerDialog();
+
     const items=[]; let total=0;
     Object.entries(cart).forEach(([id,qty])=>{
       const p=products.find(x=>x.id==id);
-      if(p){ items.push({name:p.name,size:p.size,qty,subtotal:p.price*qty}); total+=p.price*qty; }
+      if(p){
+        const price = p.salePrice||p.price;
+        items.push({name:p.name,size:p.size,qty,subtotal:price*qty});
+        total+=price*qty;
+      }
     });
     let msg=`🌹 *Pedido — ${STORE_NAME}*\n\n`;
+    msg+=`👤 *${name}*${phone?'\n📞 '+phone:''}\n\n`;
     items.forEach(i=>{ msg+=`▪ ${i.name} (${i.size}) × ${i.qty} = ${CURRENCY}${i.subtotal.toLocaleString('es-CO')}\n`; });
     msg+=`\n*Total: ${CURRENCY}${total.toLocaleString('es-CO')}*\n\n_Enviado desde la tienda web_`;
     if(ws&&ws.readyState===WebSocket.OPEN)
-      ws.send(JSON.stringify({type:'order',name:'Cliente Web',city:'',items,total:total.toLocaleString('es-CO')}));
+      ws.send(JSON.stringify({type:'order',name,phone,city:'',items,total:total.toLocaleString('es-CO')}));
     window.open(`https://wa.me/${WHATSAPP_NUMBER}?text=${encodeURIComponent(msg)}`,'_blank');
+  }
+
+  /* ── Dark / Light mode ───────────────────────────────────── */
+  function toggleTheme() {
+    const isLight = document.body.classList.toggle('light');
+    document.getElementById('themeBtn').textContent = isLight ? '🌙' : '☀️';
+    localStorage.setItem('ydf_theme', isLight ? 'light' : 'dark');
   }
 
   /* ── WebSocket ───────────────────────────────────────────── */
@@ -601,6 +734,12 @@
     const btn = e.target.closest('.brand-pill');
     if (btn) setBrand(btn.dataset.brand);
   });
+
+  /* restore saved theme */
+  if (localStorage.getItem('ydf_theme') === 'light') {
+    document.body.classList.add('light');
+    document.getElementById('themeBtn').textContent = '🌙';
+  }
 
   renderBrands();
   applyFilters();
