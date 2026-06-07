@@ -604,12 +604,13 @@
   const products = [
     {
       id: 1,
-      name: "Rose Oud",
+      name: "Yara ",
       desc: "Damascene rose meets aged oud",
-      price: 45,
-      size: "50ml",
+      price: 130.000,
+      size: "100ml",
       icon: "🌹",
-      badge: "Best Seller"
+      badge: "Best Seller",
+      image: null
     },
     {
       id: 2,
@@ -618,7 +619,8 @@
       price: 55,
       size: "100ml",
       icon: "🔶",
-      badge: null
+      badge: null,
+      image: null
     },
     {
       id: 3,
@@ -627,7 +629,8 @@
       price: 40,
       size: "50ml",
       icon: "🤍",
-      badge: null
+      badge: null,
+      image: null
     },
     {
       id: 4,
@@ -636,7 +639,8 @@
       price: 65,
       size: "100ml",
       icon: "🌵",
-      badge: "New"
+      badge: "New",
+      image: null
     },
     {
       id: 5,
@@ -645,7 +649,8 @@
       price: 50,
       size: "75ml",
       icon: "🌸",
-      badge: null
+      badge: null,
+      image: null
     },
     {
       id: 6,
@@ -654,8 +659,10 @@
       price: 80,
       size: "50ml",
       icon: "⬛",
-      badge: "Exclusive"
+      badge: "Exclusive",
+      image: null
     }
+
   ];
 
   // ── STATE ───────────────────────────────────────────────────────
@@ -667,7 +674,7 @@
     grid.innerHTML = products.map(p => `
       <div class="product-card">
         <div class="product-img">
-          <span>${p.icon}</span>
+          ${p.image ? `<img src="${p.image}" alt="${p.name}" />` : `${p.image ? `<img src="${p.image}" alt="${p.name}" />` : `<span>${p.icon}</span>`}`}
           ${p.badge ? `<div class="product-badge">${p.badge}</div>` : ""}
         </div>
         <div class="product-info">
@@ -790,10 +797,4 @@
     toastTimer = setTimeout(() => t.classList.remove("show"), 2000);
   }
 
-  // ── INIT ─────────────────────────────────────────────────────────
-  renderProducts();
-  updateCartUI();
-</script>
-
-</body>
-</html>
+  // ── INIT ───────────────────────────────────────
