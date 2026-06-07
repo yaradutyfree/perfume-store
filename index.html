@@ -567,9 +567,9 @@
     ws.onmessage=e=>{
       try{
         const m=JSON.parse(e.data);
-        if((m.type==='products'||m.type==='state')&&Array.isArray(m.products)&&m.products.length){
-          products=m.products;
-          if(Array.isArray(m.brands)&&m.brands.length) brands=m.brands;
+        if(m.type==='products'||m.type==='state'){
+          if(Array.isArray(m.products)&&m.products.length) products=m.products;
+          if(Array.isArray(m.brands)) brands=m.brands;
           renderBrands(); applyFilters(); setDot('live','En vivo');
         }
       }catch(e2){}

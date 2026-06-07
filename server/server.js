@@ -11,6 +11,7 @@ const ADMIN_SECRET = process.env.ADMIN_SECRET || 'YaraOud2024';
 
 /* ── State ─────────────────────────────────────────────── */
 let products   = [];      /* latest product list from admin */
+let brands     = [];      /* latest brand list from admin   */
 let orderCount = 0;       /* orders received today          */
 let adminWs    = null;    /* connected admin client         */
 
@@ -29,9 +30,9 @@ wss.on('connection', (ws, req) => {
 
     console.log(`[+] connection from ${req.socket.remoteAddress}`);
 
-    /* send current products immediately on connect */
+    /* send current state immediately on connect */
     if (products.length > 0) {
-        send(ws, { type: 'products', products });
+        send(ws, { type: 'products', products, brands });
     }
     send(ws, { type: 'order_count', count: orderCount });
 
@@ -53,17 +54,18 @@ wss.on('connection', (ws, req) => {
                 adminWs = ws;
                 console.log('[admin] connected');
                 /* send full state to admin */
-                send(ws, { type: 'state', products, orderCount });
+                send(ws, { type: 'state', products, brands, orderCount });
                 break;
 
             /* ── Admin pushes product update ── */
             case 'update_products':
                 if (ws.role !== 'admin') return;
                 products = msg.products || [];
-                console.log(`[admin] updated ${products.length} products`);
+                if (Array.isArray(msg.brands)) brands = msg.brands;
+                console.log(`[admin] updated ${products.length} products, ${brands.length} brands`);
                 /* broadcast to all viewers */
-                broadcast('viewer', { type: 'products', products });
-                send(ws, { type: 'ack', message: 'Products broadcast to all clients' });
+                broadcast('viewer', { type: 'products', products, brands });
+                send(ws, { type: 'ack', products, brands, message: 'Products broadcast to all clients' });
                 break;
 
             /* ── Customer places order ── */

@@ -1333,7 +1333,7 @@ static void handle(SDL_Event *e){
         /* save */
         if(pin(btn_save,mx,my)){ f2p(sel); html_save(); return; }
         /* push */
-        if(pin(btn_push,mx,my)){ f2p(sel); html_save(); git_push(); return; }
+        if(pin(btn_push,mx,my)){ f2p(sel); html_save(); git_push(); ws_send_products(); return; }
 
         tf_off(); return;
     }
