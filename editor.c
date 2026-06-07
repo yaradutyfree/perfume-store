@@ -25,7 +25,7 @@
 #define FONT_PATH "/usr/share/fonts/truetype/lato/Lato-Regular.ttf"
 
 /* ── WebSocket config ─────────────────────────────────────────────── */
-#define WS_HOST   "perfume-store-ws.onrender.com"
+#define WS_HOST   "perfume-store-ssls.onrender.com"
 #define WS_PORT   443
 #define WS_PATH   "/"
 #define WS_SECRET "YaraOud2024"
