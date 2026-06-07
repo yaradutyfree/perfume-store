@@ -604,7 +604,7 @@
   const products = [
     {
       id: 1,
-      name: "Yara 2",
+      name: "Yara 3",
       desc: "Damascene rose meets aged oud",
       price: 130.000,
       size: "100ml",
@@ -674,7 +674,7 @@
     grid.innerHTML = products.map(p => `
       <div class="product-card">
         <div class="product-img">
-          ${p.image ? `<img src="${p.image}" alt="${p.name}" />` : `${p.image ? `<img src="${p.image}" alt="${p.name}" />` : `${p.image ? `<img src="${p.image}" alt="${p.name}" />` : `${p.image ? `<img src="${p.image}" alt="${p.name}" />` : `${p.image ? `<img src="${p.image}" alt="${p.name}" />` : `${p.image ? `<img src="${p.image}" alt="${p.name}" />` : `${p.image ? `<img src="${p.image}" alt="${p.name}" />` : `${p.image ? `<img src="${p.image}" alt="${p.name}" />` : `${p.image ? `<img src="${p.image}" alt="${p.name}" />` : `${p.image ? `<img src="${p.image}" alt="${p.name}" />` : `${p.image ? `<img src="${p.image}" alt="${p.name}" />` : `${p.image ? `<img src="${p.image}" alt="${p.name}" />` : `<span>${p.icon}</span>`}`}`}`}`}`}`}`}`}`}`}`}
+          ${p.image ? `<img src="${p.image}" alt="${p.name}" />` : `${p.image ? `<img src="${p.image}" alt="${p.name}" />` : `${p.image ? `<img src="${p.image}" alt="${p.name}" />` : `${p.image ? `<img src="${p.image}" alt="${p.name}" />` : `${p.image ? `<img src="${p.image}" alt="${p.name}" />` : `${p.image ? `<img src="${p.image}" alt="${p.name}" />` : `${p.image ? `<img src="${p.image}" alt="${p.name}" />` : `${p.image ? `<img src="${p.image}" alt="${p.name}" />` : `${p.image ? `<img src="${p.image}" alt="${p.name}" />` : `${p.image ? `<img src="${p.image}" alt="${p.name}" />` : `${p.image ? `<img src="${p.image}" alt="${p.name}" />` : `${p.image ? `<img src="${p.image}" alt="${p.name}" />` : `${p.image ? `<img src="${p.image}" alt="${p.name}" />` : `${p.image ? `<img src="${p.image}" alt="${p.name}" />` : `<span>${p.icon}</span>`}`}`}`}`}`}`}`}`}`}`}`}`}`}
           ${p.badge ? `<div class="product-badge">${p.badge}</div>` : ""}
         </div>
         <div class="product-info">
@@ -782,6 +782,4 @@
     lines.push(`\n👤 *Name:* ${name}`);
     if (city) lines.push(`📍 *City:* ${city}`);
 
-    const message = encodeURIComponent(lines.join("\n"));
-    const url = `https://wa.me/${WHATSAPP_NUMBER}?text=${message}`;
-    window
+    const messag
