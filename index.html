@@ -133,6 +133,7 @@
       transition: all .2s;
     }
     .brand-pill:hover { border-color: var(--gold); color: var(--gold); }
+    .brand-pill:focus { outline: none; }
     .brand-pill.active { background: var(--gold); border-color: var(--gold); color: var(--bg); font-weight: 700; }
 
     /* ── Section heading ────────────────────────────────────── */
@@ -424,9 +425,10 @@
 
   function renderBrands() {
     const bar = document.getElementById('brandsBar');
-    let h = `<button class="brand-pill ${!activeBrand?'active':''}" onclick="setBrand('')">Todas las Marcas</button>`;
+    let h = `<button class="brand-pill ${!activeBrand?'active':''}" data-brand="">Todas las Marcas</button>`;
     brands.forEach(b => {
-      h += `<button class="brand-pill ${activeBrand===b?'active':''}" onclick="setBrand('${b.replace(/'/g,"\\'")}'">${b}</button>`;
+      const active = activeBrand && activeBrand.toLowerCase()===b.toLowerCase() ? 'active' : '';
+      h += `<button class="brand-pill ${active}" data-brand="${b.replace(/"/g,'&quot;')}">${b}</button>`;
     });
     bar.innerHTML = h;
   }
@@ -436,8 +438,9 @@
 
   function applyFilters() {
     const q = searchText.toLowerCase();
+    const ab = activeBrand.toLowerCase();
     const list = products.filter(p => {
-      const okB = !activeBrand || p.brand === activeBrand;
+      const okB = !activeBrand || (p.brand||'').toLowerCase() === ab;
       const okS = !q
         || (p.name  ||'').toLowerCase().includes(q)
         || (p.desc  ||'').toLowerCase().includes(q)
@@ -584,6 +587,11 @@
   }
 
   /* ── Init ────────────────────────────────────────────────── */
+  document.getElementById('brandsBar').addEventListener('click', e => {
+    const btn = e.target.closest('.brand-pill');
+    if (btn) setBrand(btn.dataset.brand);
+  });
+
   renderBrands();
   applyFilters();
   wsConnect();
