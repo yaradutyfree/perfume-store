@@ -68,11 +68,13 @@ typedef struct {
     char name[64];
     char desc[128];
     char price[20];
+    char sale_price[20];
     char size[16];
     char badge[32];
     char icon[16];
     char image[256];
     char brand[48];
+    int  in_stock;  /* 1=available, 0=out of stock */
 } Prod;
 
 /* ── Brands ──────────────────────────────────────────────────── */
@@ -167,7 +169,7 @@ static Prod prods[MAX_PRODS];
 static int  np = 0, sel = 0, nxtid = 100;
 static int  list_scroll = 0;
 
-enum { FN=0, FD, FP, FS, FB_F, FB_BRAND, NF };
+enum { FN=0, FD, FP, FSP, FS, FB_F, FB_BRAND, NF };
 static TF   tfs[NF];
 static int  atf = -1;
 
@@ -178,7 +180,7 @@ static char   stmsg[256] = "Loading...";
 
 static SDL_Rect
     btn_add, btn_del,
-    btn_browse, btn_paste,
+    btn_browse, btn_paste, btn_instock,
     btn_save, btn_push, btn_wssync, btn_brands;
 
 static int hov_item = -1;
@@ -409,17 +411,20 @@ static void ws_send_products(void){
         "{\"type\":\"update_products\",\"secret\":\"%s\",\"products\":[", WS_SECRET);
     for(int i=0;i<np&&pos<(int)sizeof(json)-512;i++){
         Prod *p=&prods[i];
-        char bj[48],ij[280];
-        if(p->badge[0]) snprintf(bj,sizeof(bj),"\"%s\"",p->badge); else strcpy(bj,"null");
-        if(p->image[0]) snprintf(ij,sizeof(ij),"\"%s\"",p->image); else strcpy(ij,"null");
+        char bj[48],ij[280],spj[40];
+        if(p->badge[0])      snprintf(bj, sizeof(bj), "\"%s\"",p->badge); else strcpy(bj,"null");
+        if(p->image[0])      snprintf(ij, sizeof(ij), "\"%s\"",p->image); else strcpy(ij,"null");
+        if(p->sale_price[0]) snprintf(spj,sizeof(spj),"%s",    p->sale_price); else strcpy(spj,"null");
         pos += snprintf(json+pos, sizeof(json)-pos,
             "{\"id\":%d,\"name\":\"%s\",\"desc\":\"%s\","
             "\"price\":%s,\"size\":\"%s\",\"icon\":\"%s\","
-            "\"badge\":%s,\"image\":%s}%s",
+            "\"badge\":%s,\"image\":%s,\"inStock\":%s,\"salePrice\":%s}%s",
             p->id,p->name,p->desc,
             p->price[0]?p->price:"0",
             p->size,p->icon[0]?p->icon:"🌺",
-            bj,ij, i<np-1?",":"");
+            bj,ij,
+            p->in_stock?"true":"false",spj,
+            i<np-1?",":"");
     }
     snprintf(json+pos, sizeof(json)-pos,"]}");
     wsq_push(json);
@@ -534,17 +539,22 @@ static void html_load(void){
         Prod *pr=&prods[np]; memset(pr,0,sizeof(Prod));
         char tmp[32];
         if(exfield(blk,"id",tmp,sizeof(tmp))) pr->id=atoi(tmp);
-        exfield(blk,"name", pr->name, sizeof(pr->name));
-        exfield(blk,"desc", pr->desc, sizeof(pr->desc));
-        exfield(blk,"price",pr->price,sizeof(pr->price));
-        exfield(blk,"size", pr->size, sizeof(pr->size));
-        exfield(blk,"badge",pr->badge,sizeof(pr->badge));
-        exfield(blk,"icon", pr->icon, sizeof(pr->icon));
-        exfield(blk,"image",pr->image,sizeof(pr->image));
-        exfield(blk,"brand",pr->brand,sizeof(pr->brand));
-        if(!strcmp(pr->badge,"null")) pr->badge[0]=0;
-        if(!strcmp(pr->image,"null")) pr->image[0]=0;
-        if(!strcmp(pr->brand,"null")) pr->brand[0]=0;
+        exfield(blk,"name",      pr->name,       sizeof(pr->name));
+        exfield(blk,"desc",      pr->desc,       sizeof(pr->desc));
+        exfield(blk,"price",     pr->price,      sizeof(pr->price));
+        exfield(blk,"size",      pr->size,       sizeof(pr->size));
+        exfield(blk,"badge",     pr->badge,      sizeof(pr->badge));
+        exfield(blk,"icon",      pr->icon,       sizeof(pr->icon));
+        exfield(blk,"image",     pr->image,      sizeof(pr->image));
+        exfield(blk,"brand",     pr->brand,      sizeof(pr->brand));
+        exfield(blk,"salePrice", pr->sale_price, sizeof(pr->sale_price));
+        if(!strcmp(pr->badge,"null"))      pr->badge[0]=0;
+        if(!strcmp(pr->image,"null"))      pr->image[0]=0;
+        if(!strcmp(pr->brand,"null"))      pr->brand[0]=0;
+        if(!strcmp(pr->sale_price,"null")) pr->sale_price[0]=0;
+        /* inStock: default true; false only if explicitly "false" */
+        {char stk[8]="true"; exfield(blk,"inStock",stk,sizeof(stk));
+         pr->in_stock = strcmp(stk,"false")?1:0;}
         if(pr->id>=nxtid) nxtid=pr->id+1;
         if(pr->name[0]) np++;
         free(blk); p=cb;
@@ -585,10 +595,11 @@ static void html_save(void){
     int pos=0; pos+=snprintf(njs+pos,BUF_MAX-pos,"\n");
     for(int i=0;i<np;i++){
         Prod *p=&prods[i];
-        char bj[80],ij[300],brj[80];
-        if(p->badge[0]) snprintf(bj,sizeof(bj),"\"%s\"",p->badge); else strcpy(bj,"null");
-        if(p->image[0]) snprintf(ij,sizeof(ij),"\"%s\"",p->image); else strcpy(ij,"null");
-        if(p->brand[0]) snprintf(brj,sizeof(brj),"\"%s\"",p->brand); else strcpy(brj,"null");
+        char bj[80],ij[300],brj[80],spj[40];
+        if(p->badge[0])      snprintf(bj, sizeof(bj), "\"%s\"",p->badge); else strcpy(bj,"null");
+        if(p->image[0])      snprintf(ij, sizeof(ij), "\"%s\"",p->image); else strcpy(ij,"null");
+        if(p->brand[0])      snprintf(brj,sizeof(brj),"\"%s\"",p->brand); else strcpy(brj,"null");
+        if(p->sale_price[0]) snprintf(spj,sizeof(spj),"%s",    p->sale_price); else strcpy(spj,"null");
         pos+=snprintf(njs+pos,BUF_MAX-pos,
             "    {\n"
             "      id: %d,\n"
@@ -599,12 +610,17 @@ static void html_save(void){
             "      icon: \"%s\",\n"
             "      badge: %s,\n"
             "      image: %s,\n"
-            "      brand: %s\n"
+            "      brand: %s,\n"
+            "      inStock: %s,\n"
+            "      salePrice: %s\n"
             "    }%s\n",
             p->id,p->name,p->desc,
             p->price[0]?p->price:"0",
             p->size,p->icon[0]?p->icon:"🌹",
-            bj,ij,brj, i<np-1?",":"");
+            bj,ij,brj,
+            p->in_stock?"true":"false",
+            spj,
+            i<np-1?",":"");
     }
 
     /* find brands section in original buf to replace it */
@@ -680,19 +696,21 @@ static void p2f(int i){
     if(i<0||i>=np) return;
     Prod *p=&prods[i];
     tf_set(&tfs[FN],p->name); tf_set(&tfs[FD],p->desc);
-    tf_set(&tfs[FP],p->price);tf_set(&tfs[FS],p->size);
+    tf_set(&tfs[FP],p->price); tf_set(&tfs[FSP],p->sale_price);
+    tf_set(&tfs[FS],p->size);
     tf_set(&tfs[FB_F],p->badge); tf_set(&tfs[FB_BRAND],p->brand);
     img_load(p->image);
 }
 static void f2p(int i){
     if(i<0||i>=np) return;
     Prod *p=&prods[i];
-    strncpy(p->name, tfs[FN].buf, 63);
-    strncpy(p->desc, tfs[FD].buf,127);
-    strncpy(p->price,tfs[FP].buf, 19);
-    strncpy(p->size, tfs[FS].buf, 15);
-    strncpy(p->badge,tfs[FB_F].buf,31);
-    strncpy(p->brand,tfs[FB_BRAND].buf,47);
+    strncpy(p->name,      tfs[FN].buf,      63);
+    strncpy(p->desc,      tfs[FD].buf,     127);
+    strncpy(p->price,     tfs[FP].buf,      19);
+    strncpy(p->sale_price,tfs[FSP].buf,     19);
+    strncpy(p->size,      tfs[FS].buf,      15);
+    strncpy(p->badge,     tfs[FB_F].buf,    31);
+    strncpy(p->brand,     tfs[FB_BRAND].buf,47);
     dirty=1;
 }
 
@@ -856,12 +874,13 @@ static void layout(void){
     int fx=rx+PAD, fw=rw-PAD*2;
     int fy=56, gap=TF_H+26;
 
-    tfs[FN].rect=(SDL_Rect){fx,         fy,       fw,      TF_H};
-    tfs[FD].rect=(SDL_Rect){fx,         fy+gap,   fw,      TF_H};
-    tfs[FP].rect=(SDL_Rect){fx,         fy+gap*2, fw/4-4,  TF_H};
-    tfs[FS].rect=(SDL_Rect){fx+fw/4+4,  fy+gap*2, fw/4-4,  TF_H};
-    tfs[FB_F].rect=(SDL_Rect){fx+fw/2+4,fy+gap*2, fw/4-4,  TF_H};
-    tfs[FB_BRAND].rect=(SDL_Rect){fx+fw*3/4+6,fy+gap*2, fw/4-6, TF_H};
+    tfs[FN].rect=(SDL_Rect){fx,           fy,       fw,        TF_H};
+    tfs[FD].rect=(SDL_Rect){fx,           fy+gap,   fw,        TF_H};
+    tfs[FP].rect=(SDL_Rect){fx,           fy+gap*2, fw/5-4,    TF_H};
+    tfs[FSP].rect=(SDL_Rect){fx+fw/5+4,   fy+gap*2, fw/5-4,    TF_H};
+    tfs[FS].rect=(SDL_Rect){fx+fw*2/5+6,  fy+gap*2, fw/5-4,    TF_H};
+    tfs[FB_F].rect=(SDL_Rect){fx+fw*3/5+8,fy+gap*2, fw/5-4,    TF_H};
+    tfs[FB_BRAND].rect=(SDL_Rect){fx+fw*4/5+10,fy+gap*2,fw/5-10,TF_H};
 
     strcpy(tfs[FN].label,"Name");
     strcpy(tfs[FN].hint,"e.g. Rose Oud");
@@ -869,6 +888,8 @@ static void layout(void){
     strcpy(tfs[FD].hint,"Short tagline");
     strcpy(tfs[FP].label,"Price");
     strcpy(tfs[FP].hint,"130000");
+    strcpy(tfs[FSP].label,"Sale Price");
+    strcpy(tfs[FSP].hint,"empty=none");
     strcpy(tfs[FS].label,"Size");
     strcpy(tfs[FS].hint,"100ml");
     strcpy(tfs[FB_F].label,"Badge");
@@ -877,8 +898,9 @@ static void layout(void){
     strcpy(tfs[FB_BRAND].hint,"Lattafa");
 
     int img_y=fy+gap*3+8;
-    btn_browse=(SDL_Rect){fx,       img_y,160,34};
-    btn_paste =(SDL_Rect){fx+168,   img_y,160,34};
+    btn_instock=(SDL_Rect){fx,          img_y-44, 120, 26};
+    btn_browse =(SDL_Rect){fx,          img_y,    160, 34};
+    btn_paste  =(SDL_Rect){fx+168,      img_y,    160, 34};
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -996,6 +1018,14 @@ static void render(void){
         for(int i=0;i<NF;i++){
             dt(tfs[i].label,tfs[i].rect.x,tfs[i].rect.y-16,fSM,MUTED);
             tf_draw(&tfs[i],atf==i);
+        }
+
+        /* in_stock toggle */
+        {
+            int stk=prods[sel].in_stock;
+            SDL_Color bc=stk?C(14,55,28):C(60,14,14);
+            SDL_Color fc=stk?GRN:RED;
+            btn(btn_instock, stk?"✓ En Stock":"✗ Agotado", bc,fc);
         }
 
         /* image section */
@@ -1310,6 +1340,7 @@ static void handle(SDL_Event *e){
             Prod *p=&prods[np]; memset(p,0,sizeof(Prod));
             p->id=nxtid++; strcpy(p->name,"New Perfume");
             strcpy(p->price,"0"); strcpy(p->size,"100ml"); strcpy(p->icon,"🌹");
+            p->in_stock=1;
             sel=np++; p2f(sel); dirty=1; return;
         }
         /* delete */
@@ -1322,6 +1353,10 @@ static void handle(SDL_Event *e){
         /* text fields */
         for(int i=0;i<NF;i++){
             if(pin(tfs[i].rect,mx,my)){ f2p(sel); tf_on(i); return; }
+        }
+        /* in_stock toggle */
+        if(pin(btn_instock,mx,my)&&np>0){
+            f2p(sel); prods[sel].in_stock^=1; dirty=1; return;
         }
         /* browse */
         if(pin(btn_browse,mx,my)){ f2p(sel); tf_off(); fb_open_browser(); return; }
