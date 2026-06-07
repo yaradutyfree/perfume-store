@@ -190,7 +190,9 @@
       color: var(--muted);
       font-size: .56rem; letter-spacing: .12em; text-transform: uppercase;
       padding: 4px 8px;
+      cursor: pointer; transition: color .15s, background .15s;
     }
+    .prod-brand-tag:hover { color: var(--gold); background: rgba(201,168,76,.12); }
 
     .prod-info { padding: 16px 16px 6px; flex: 1; }
     .prod-name {
@@ -431,7 +433,12 @@
     bar.innerHTML = h;
   }
 
-  function setBrand(b) { activeBrand = b; renderBrands(); applyFilters(); }
+  function setBrand(b) {
+    activeBrand = b;
+    renderBrands();
+    applyFilters();
+    document.getElementById('brandsBar').scrollIntoView({behavior:'smooth', block:'nearest'});
+  }
   function onSearch(v) { searchText = v.trim(); applyFilters(); }
 
   function applyFilters() {
@@ -470,7 +477,7 @@
         <div class="prod-img-wrap">
           ${imgH}
           ${p.badge?`<div class="prod-badge">${p.badge}</div>`:''}
-          ${p.brand?`<div class="prod-brand-tag">${p.brand}</div>`:''}
+          ${p.brand?`<div class="prod-brand-tag" onclick="setBrand('${p.brand.replace(/'/g,"\\'")}')">${p.brand}</div>`:''}
         </div>
         <div class="prod-info">
           <div class="prod-name">${p.name}</div>
