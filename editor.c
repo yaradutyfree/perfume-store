@@ -1,850 +1,595 @@
 /*
- * Perfume Store Product Editor
+ * Perfume Store Product Editor — full rewrite
+ * WebSocket runs in a background thread; SDL loop never blocks.
  * Build: make
- * Features: file browser, clipboard paste, webp/jpg/gif/png, WebSocket live sync
  */
 
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_ttf.h>
 #include <SDL2/SDL_image.h>
 #include <libwebsockets.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
-#include <sys/stat.h>
-#include <sys/types.h>
 #include <dirent.h>
 #include <unistd.h>
-#include <pthread.h>
+#include <sys/stat.h>
 
-/* ── Paths ────────────────────────────────────────────────────────── */
-#define HTML_PATH "/home/xmm/Projects/perfume-store/index.html"
-#define IMG_DIR   "/home/xmm/Projects/perfume-store/images"
-#define GIT_DIR   "/home/xmm/Projects/perfume-store"
-#define FONT_PATH "/usr/share/fonts/truetype/lato/Lato-Regular.ttf"
+/* ── Paths ─────────────────────────────────────────────────── */
+#define HTML_PATH  "/home/xmm/Projects/perfume-store/index.html"
+#define IMG_DIR    "/home/xmm/Projects/perfume-store/images"
+#define GIT_DIR    "/home/xmm/Projects/perfume-store"
+#define FONT_PATH  "/usr/share/fonts/truetype/lato/Lato-Regular.ttf"
+#define WS_HOST    "perfume-store-ssls.onrender.com"
+#define WS_PORT    443
+#define WS_PATH    "/"
+#define WS_SECRET  "YaraOud2024"
 
-/* ── WebSocket config ─────────────────────────────────────────────── */
-#define WS_HOST   "perfume-store-ssls.onrender.com"
-#define WS_PORT   443
-#define WS_PATH   "/"
-#define WS_SECRET "YaraOud2024"
+/* ── Layout ─────────────────────────────────────────────────── */
+#define WIN_W     920
+#define WIN_H     660
+#define LIST_W    240
+#define BAR_H      52
+#define STAT_H     26
+#define PAD        14
+#define TF_H       36
+#define ITEM_H     50
 
-/* ── Window layout ────────────────────────────────────────────────── */
-#define WIN_W    900
-#define WIN_H    660
-#define LIST_W   230
-#define BTN_BAR  52
-#define STAT_H   26
-#define PAD      14
-#define TF_H     34
+/* ── Limits ─────────────────────────────────────────────────── */
+#define MAX_PRODS  32
+#define BUF_MAX    (1<<21)   /* 2 MB */
+#define FB_MAX     1024
+#define FB_ROW      28
 
-/* ── Limits ───────────────────────────────────────────────────────── */
-#define MAX_PRODS   20
-#define BUF_MAX     (1 << 20)
-#define FB_MAX      1024
-#define FB_ITEM_H   28
-
-/* ── Colors ───────────────────────────────────────────────────────── */
+/* ── Colors ─────────────────────────────────────────────────── */
+#define C(r,g,b)  ((SDL_Color){r,g,b,255})
 static const SDL_Color
-    C_BG    = {14,  14,  14,  255},
-    C_PANEL = {20,  20,  20,  255},
-    C_CARD  = {26,  26,  26,  255},
-    C_BDR   = {44,  44,  44,  255},
-    C_GOLD  = {201, 168, 76,  255},
-    C_LGOLD = {230, 200, 120, 255},
-    C_TEXT  = {240, 234, 214, 255},
-    C_MUTE  = {110, 110, 110, 255},
-    C_SEL   = {38,  30,  8,   255},
-    C_HOV   = {26,  22,  6,   255},
-    C_GRN   = {37,  175, 85,  255},
-    C_RED   = {165, 50,  50,  255},
-    C_PURP  = {75,  100, 200, 255},
-    C_DARK2 = {14,  14,  14,  255},
-    C_FBHOV = {32,  38,  50,  255},
-    C_FBSEL = {40,  60,  90,  255};
+    BG    = C( 12, 12, 12),
+    PANEL = C( 20, 20, 20),
+    CARD  = C( 26, 26, 26),
+    BDR   = C( 42, 42, 42),
+    GOLD  = C(201,168, 76),
+    LGOLD = C(228,198,118),
+    TEXT  = C(240,234,214),
+    MUTED = C(105,105,105),
+    SELB  = C( 38, 30,  8),
+    HOVB  = C( 26, 22,  6),
+    GRN   = C( 37,175, 85),
+    RED   = C(160, 48, 48),
+    BLUE  = C( 60,110,200),
+    FBHOV = C( 28, 36, 50),
+    FBSEL = C( 38, 58, 90);
 
-/* ── Product ──────────────────────────────────────────────────────── */
+/* ── Product ─────────────────────────────────────────────────── */
 typedef struct {
     int  id;
     char name[64];
     char desc[128];
-    char price[16];
+    char price[20];
     char size[16];
     char badge[32];
     char icon[16];
     char image[256];
+    char brand[48];
 } Prod;
 
-/* ── Text field ───────────────────────────────────────────────────── */
+/* ── Brands ──────────────────────────────────────────────────── */
+#define MAX_BRANDS 24
+static char brands[MAX_BRANDS][48];
+static int  nb = 0;
+
+/* ── Text field ──────────────────────────────────────────────── */
 typedef struct {
     char     buf[256];
-    int      len, cursor, active;
+    int      len, cur, active;
     SDL_Rect rect;
     char     label[32];
     char     hint[64];
 } TF;
 
-/* ── File browser entry ───────────────────────────────────────────── */
-typedef struct {
-    char name[256];
-    char fullpath[512];
-    int  is_dir;
-} FBEntry;
+/* ── File browser entry ──────────────────────────────────────── */
+typedef struct { char name[256]; char path[512]; int is_dir; } FBEntry;
 
-/* ── File browser state ───────────────────────────────────────────── */
+/* ── WS event queue (ws-thread → main-thread) ───────────────── */
+typedef enum { WEV_CONNECTED, WEV_DISCONNECTED, WEV_ORDER, WEV_SYNCED } WEvKind;
+typedef struct { WEvKind kind; char data[512]; } WEvent;
+#define WEV_CAP 16
+static WEvent     wev_buf[WEV_CAP];
+static int        wev_head = 0, wev_tail = 0;
+static pthread_mutex_t wev_mtx = PTHREAD_MUTEX_INITIALIZER;
+
+static void wev_push(WEvKind k, const char *d) {
+    pthread_mutex_lock(&wev_mtx);
+    int next = (wev_tail + 1) % WEV_CAP;
+    if (next != wev_head) {
+        wev_buf[wev_tail].kind = k;
+        strncpy(wev_buf[wev_tail].data, d ? d : "", 511);
+        wev_tail = next;
+    }
+    pthread_mutex_unlock(&wev_mtx);
+}
+
+static int wev_pop(WEvent *out) {
+    pthread_mutex_lock(&wev_mtx);
+    if (wev_head == wev_tail) { pthread_mutex_unlock(&wev_mtx); return 0; }
+    *out = wev_buf[wev_head];
+    wev_head = (wev_head + 1) % WEV_CAP;
+    pthread_mutex_unlock(&wev_mtx);
+    return 1;
+}
+
+/* ── WS send queue (main-thread → ws-thread) ────────────────── */
+#define WSQ_CAP 4
+static char       wsq_buf[WSQ_CAP][8192];
+static int        wsq_head = 0, wsq_tail = 0;
+static pthread_mutex_t wsq_mtx = PTHREAD_MUTEX_INITIALIZER;
+static struct lws_context *ws_ctx = NULL;
+static struct lws         *ws_wsi = NULL;
+
+static void wsq_push(const char *json) {
+    pthread_mutex_lock(&wsq_mtx);
+    int next = (wsq_tail + 1) % WSQ_CAP;
+    if (next != wsq_head) {
+        strncpy(wsq_buf[wsq_tail], json, 8191);
+        wsq_tail = next;
+    }
+    pthread_mutex_unlock(&wsq_mtx);
+    if (ws_ctx) lws_cancel_service(ws_ctx);
+}
+
+/* ── WS state (atomic-ish, read from main thread) ───────────── */
+typedef enum { WS_OFF=0, WS_CONN, WS_READY } WsState;
+static volatile WsState ws_state  = WS_OFF;
+static volatile int     ws_orders = 0;
+static volatile int     ws_running = 1;
+
+/* ── Notification ────────────────────────────────────────────── */
 static struct {
-    int      open;
-    char     path[512];
-    FBEntry  entries[FB_MAX];
-    int      count;
-    int      scroll;
-    int      hovered;
-    int      selected;
-    SDL_Rect rect;       /* full dialog rect */
-    SDL_Rect list_rect;  /* scrollable list area */
-} fb;
+    int    on;
+    char   name[64];
+    char   city[64];
+    char   total[24];
+    int    order_no;
+    Uint32 at;
+} notif;
+static pthread_mutex_t notif_mtx = PTHREAD_MUTEX_INITIALIZER;
 
-/* ── Globals ──────────────────────────────────────────────────────── */
-static SDL_Window   *gwin  = NULL;
-static SDL_Renderer *gren  = NULL;
-static TTF_Font     *gfnt  = NULL;
-static TTF_Font     *gfsm  = NULL;
-static TTF_Font     *gflg  = NULL;
+/* ── Globals ─────────────────────────────────────────────────── */
+static SDL_Window   *gwin = NULL;
+static SDL_Renderer *gren = NULL;
+static TTF_Font     *fMD  = NULL;   /* 14 */
+static TTF_Font     *fSM  = NULL;   /* 11 */
+static TTF_Font     *fLG  = NULL;   /* 18 */
 
-static Prod  prods[MAX_PRODS];
-static int   np    = 0;
-static int   sel   = 0;
-static int   nxtid = 100;
+static Prod prods[MAX_PRODS];
+static int  np = 0, sel = 0, nxtid = 100;
+static int  list_scroll = 0;
 
-enum { FN=0, FD, FP, FS, FB_F, NFIELDS };
-static TF   tfs[NFIELDS];
+enum { FN=0, FD, FP, FS, FB_F, FB_BRAND, NF };
+static TF   tfs[NF];
 static int  atf = -1;
 
 static SDL_Texture *imgtex = NULL;
-static int          imgw, imgh;
+static int imgw = 0, imgh = 0;
 
-static char   stmsg[256] = "Ready";
-static Uint32 sttime     = 0;
+static char   stmsg[256] = "Loading...";
 
-static SDL_Rect btn_add, btn_del, btn_save, btn_push, btn_browse, btn_paste, btn_wssync;
+static SDL_Rect
+    btn_add, btn_del,
+    btn_browse, btn_paste,
+    btn_save, btn_push, btn_wssync, btn_brands;
+
 static int hov_item = -1;
 static int dirty    = 0;
 
-/* ── WebSocket state ──────────────────────────────────────────────── */
-typedef enum { WS_DISCONNECTED=0, WS_CONNECTING, WS_CONNECTED } WsState;
-
-static struct lws_context *ws_ctx    = NULL;
-static struct lws         *ws_wsi    = NULL;
-static WsState             ws_state  = WS_DISCONNECTED;
-static int                 ws_orders = 0;   /* total orders today       */
-static int                 ws_send_products = 0; /* flag: send products  */
-static pthread_mutex_t     ws_mutex  = PTHREAD_MUTEX_INITIALIZER;
-
-/* notification popup */
+/* file browser */
 static struct {
-    int      visible;
-    char     name[64];
-    char     city[64];
-    char     total[16];
-    char     items_text[256];
-    Uint32   shown_at;
-} ws_notif;
+    int     open;
+    char    path[512];
+    FBEntry ents[FB_MAX];
+    int     cnt, scroll, hov, sel2;
+    SDL_Rect rect, list;
+} fb;
 
-/* send queue (JSON string) */
-static char ws_send_buf[8192];
-static int  ws_send_len = 0;
+/* brands panel */
+static struct {
+    int      open;
+    char     addbuf[48];
+    int      addlen;
+    int      hov;
+    SDL_Rect rect;
+} bp;
 
-/* ═══════════════════════════════════════════════════════════════════
-   Drawing helpers
-   ═══════════════════════════════════════════════════════════════════ */
-static void scol(SDL_Color c) { SDL_SetRenderDrawColor(gren, c.r, c.g, c.b, c.a); }
-static void frect(SDL_Rect r, SDL_Color c) { scol(c); SDL_RenderFillRect(gren, &r); }
-static void drect(SDL_Rect r, SDL_Color c) { scol(c); SDL_RenderDrawRect(gren, &r); }
-static void hline(int x1, int x2, int y, SDL_Color c) {
-    scol(c); SDL_RenderDrawLine(gren, x1, y, x2, y);
+/* ═══════════════════════════════════════════════════════════════
+   Drawing
+   ═══════════════════════════════════════════════════════════════ */
+static void sc(SDL_Color c) { SDL_SetRenderDrawColor(gren,c.r,c.g,c.b,c.a); }
+static void fr(SDL_Rect r, SDL_Color c) { sc(c); SDL_RenderFillRect(gren,&r); }
+static void dr(SDL_Rect r, SDL_Color c) { sc(c); SDL_RenderDrawRect(gren,&r); }
+static void hl(int x1,int x2,int y,SDL_Color c){ sc(c); SDL_RenderDrawLine(gren,x1,y,x2,y); }
+
+static SDL_Texture *mktex(const char *t,TTF_Font *f,SDL_Color c,int*w,int*h){
+    if(!t||!t[0]) return NULL;
+    SDL_Surface *s=TTF_RenderUTF8_Blended(f,t,c);
+    if(!s) return NULL;
+    SDL_Texture *tx=SDL_CreateTextureFromSurface(gren,s);
+    if(w)*w=s->w; if(h)*h=s->h;
+    SDL_FreeSurface(s); return tx;
 }
 
-static SDL_Texture *make_tex(const char *t, TTF_Font *f, SDL_Color c, int *ow, int *oh) {
-    if (!t || !t[0]) return NULL;
-    SDL_Surface *s = TTF_RenderUTF8_Blended(f, t, c);
-    if (!s) return NULL;
-    SDL_Texture *tx = SDL_CreateTextureFromSurface(gren, s);
-    if (ow) *ow = s->w;
-    if (oh) *oh = s->h;
-    SDL_FreeSurface(s);
-    return tx;
+static void dt(const char *t,int x,int y,TTF_Font *f,SDL_Color c){
+    int w,h; SDL_Texture *tx=mktex(t,f,c,&w,&h);
+    if(!tx) return;
+    SDL_Rect d={x,y,w,h}; SDL_RenderCopy(gren,tx,NULL,&d); SDL_DestroyTexture(tx);
 }
 
-static void dtext(const char *t, int x, int y, TTF_Font *f, SDL_Color c) {
-    int w, h;
-    SDL_Texture *tx = make_tex(t, f, c, &w, &h);
-    if (!tx) return;
-    SDL_Rect d = {x, y, w, h};
-    SDL_RenderCopy(gren, tx, NULL, &d);
+static void dtclip(const char *t,SDL_Rect clip,TTF_Font *f,SDL_Color c){
+    int w,h; SDL_Texture *tx=mktex(t,f,c,&w,&h);
+    if(!tx) return;
+    SDL_Rect src={0,0,w,h};
+    SDL_Rect dst={clip.x, clip.y+(clip.h-h)/2, w, h};
+    if(dst.x+dst.w > clip.x+clip.w){ src.w=clip.x+clip.w-dst.x; dst.w=src.w; }
+    if(src.w<=0){ SDL_DestroyTexture(tx); return; }
+    SDL_RenderSetClipRect(gren,&clip);
+    SDL_RenderCopy(gren,tx,&src,&dst);
+    SDL_RenderSetClipRect(gren,NULL);
     SDL_DestroyTexture(tx);
 }
 
-static void dtext_clip(const char *t, SDL_Rect clip, TTF_Font *f, SDL_Color c) {
-    int w, h;
-    SDL_Texture *tx = make_tex(t, f, c, &w, &h);
-    if (!tx) return;
-    SDL_Rect src = {0, 0, w, h};
-    SDL_Rect dst = {clip.x, clip.y + (clip.h - h) / 2, w, h};
-    if (dst.x + dst.w > clip.x + clip.w) {
-        src.w = clip.x + clip.w - dst.x;
-        dst.w = src.w;
-    }
-    if (src.w <= 0) { SDL_DestroyTexture(tx); return; }
-    SDL_RenderSetClipRect(gren, &clip);
-    SDL_RenderCopy(gren, tx, &src, &dst);
-    SDL_RenderSetClipRect(gren, NULL);
-    SDL_DestroyTexture(tx);
+static void dtctr(const char *t,SDL_Rect r,TTF_Font *f,SDL_Color c){
+    int w,h; SDL_Texture *tx=mktex(t,f,c,&w,&h);
+    if(!tx) return;
+    SDL_Rect d={r.x+(r.w-w)/2, r.y+(r.h-h)/2, w, h};
+    SDL_RenderCopy(gren,tx,NULL,&d); SDL_DestroyTexture(tx);
 }
 
-static void dtext_center(const char *t, SDL_Rect r, TTF_Font *f, SDL_Color c) {
-    int w, h;
-    SDL_Texture *tx = make_tex(t, f, c, &w, &h);
-    if (!tx) return;
-    SDL_Rect d = {r.x + (r.w - w) / 2, r.y + (r.h - h) / 2, w, h};
-    SDL_RenderCopy(gren, tx, NULL, &d);
-    SDL_DestroyTexture(tx);
+static void btn(SDL_Rect r,const char *lbl,SDL_Color bg,SDL_Color fg){
+    fr(r,bg); dr(r,BDR); dtctr(lbl,r,fMD,fg);
 }
 
-static void set_status(const char *msg) {
-    strncpy(stmsg, msg, sizeof(stmsg) - 1);
-    stmsg[sizeof(stmsg)-1] = '\0';
-    sttime = SDL_GetTicks();
+static void set_st(const char *m){
+    strncpy(stmsg,m,255); stmsg[255]=0;
 }
 
-/* ═══════════════════════════════════════════════════════════════════
-   WebSocket — simple JSON helpers (no external lib needed)
-   ═══════════════════════════════════════════════════════════════════ */
-
-/* extract string value from a flat JSON message */
-static int json_str(const char *json, const char *key, char *out, int outsz) {
-    char search[64];
-    snprintf(search, sizeof(search), "\"%s\"", key);
-    const char *p = strstr(json, search);
-    if (!p) return 0;
-    p += strlen(search);
-    while (*p == ':' || *p == ' ') p++;
-    if (*p == '"') {
-        p++;
-        int i = 0;
-        while (*p && *p != '"' && i < outsz-1) out[i++] = *p++;
-        out[i] = '\0'; return 1;
-    }
-    /* number */
-    int i = 0;
-    while (*p && *p != ',' && *p != '}' && i < outsz-1) out[i++] = *p++;
-    out[i] = '\0'; return 1;
+/* ═══════════════════════════════════════════════════════════════
+   JSON helpers (no external lib)
+   ═══════════════════════════════════════════════════════════════ */
+static int jstr(const char *j,const char *key,char *out,int sz){
+    char k[64]; snprintf(k,sizeof(k),"\"%s\"",key);
+    const char *p=strstr(j,k); if(!p) return 0;
+    p+=strlen(k); while(*p==':'||*p==' ')p++;
+    if(*p=='"'){ p++; int i=0; while(*p&&*p!='"'&&i<sz-1) out[i++]=*p++; out[i]=0; return 1; }
+    if(strncmp(p,"null",4)==0){ out[0]=0; return 1; }
+    int i=0; while(*p&&*p!=','&&*p!='}'&&*p!='\n'&&i<sz-1) out[i++]=*p++;
+    while(i>0&&isspace((unsigned char)out[i-1])) i--;
+    out[i]=0; return 1;
 }
 
-/* build products JSON array from current prods[] */
-static void build_products_json(char *out, int outsz) {
-    int pos = 0;
-    pos += snprintf(out+pos, outsz-pos,
-        "{\"type\":\"update_products\",\"secret\":\"%s\",\"products\":[", WS_SECRET);
-    for (int i = 0; i < np && pos < outsz-256; i++) {
-        Prod *p = &prods[i];
-        char badge_js[48], image_js[280];
-        if (p->badge[0]) snprintf(badge_js, sizeof(badge_js), "\"%s\"", p->badge);
-        else strcpy(badge_js, "null");
-        if (p->image[0]) snprintf(image_js, sizeof(image_js), "\"%s\"", p->image);
-        else strcpy(image_js, "null");
-        pos += snprintf(out+pos, outsz-pos,
-            "{\"id\":%d,\"name\":\"%s\",\"desc\":\"%s\","
-            "\"price\":%s,\"size\":\"%s\",\"icon\":\"%s\","
-            "\"badge\":%s,\"image\":%s}%s",
-            p->id, p->name, p->desc,
-            p->price[0] ? p->price : "0",
-            p->size, p->icon[0] ? p->icon : "🌺",
-            badge_js, image_js,
-            i < np-1 ? "," : "");
-    }
-    pos += snprintf(out+pos, outsz-pos, "]}");
-}
-
-/* ── LWS callback ── */
-static int ws_callback(struct lws *wsi, enum lws_callback_reasons reason,
-                       void *user, void *in, size_t len)
+/* ═══════════════════════════════════════════════════════════════
+   WebSocket (runs in background thread)
+   ═══════════════════════════════════════════════════════════════ */
+static int ws_cb(struct lws *wsi, enum lws_callback_reasons reason,
+                 void *user, void *in, size_t len)
 {
     (void)user;
-    switch (reason) {
+    switch(reason){
 
-        case LWS_CALLBACK_CLIENT_ESTABLISHED:
-            pthread_mutex_lock(&ws_mutex);
-            ws_state = WS_CONNECTED;
-            ws_wsi   = wsi;
-            pthread_mutex_unlock(&ws_mutex);
-            set_status("WebSocket connected — sending auth...");
-            /* request writable to send auth */
+    case LWS_CALLBACK_CLIENT_ESTABLISHED:
+        ws_wsi   = wsi;
+        ws_state = WS_CONN;
+        wev_push(WEV_CONNECTED, NULL);
+        lws_callback_on_writable(wsi);
+        break;
+
+    case LWS_CALLBACK_CLIENT_WRITEABLE: {
+        /* send auth first, then any queued messages */
+        static int authed = 0;
+        char msg[8192+LWS_PRE];
+        int  mlen = 0;
+
+        pthread_mutex_lock(&wsq_mtx);
+        if(!authed){
+            mlen = snprintf(msg+LWS_PRE, sizeof(msg)-LWS_PRE,
+                "{\"type\":\"admin_auth\",\"secret\":\"%s\"}", WS_SECRET);
+            authed = 1;
+        } else if(wsq_head != wsq_tail){
+            mlen = (int)strlen(wsq_buf[wsq_head]);
+            memcpy(msg+LWS_PRE, wsq_buf[wsq_head], mlen);
+            wsq_head = (wsq_head+1) % WSQ_CAP;
+        }
+        int more = (wsq_head != wsq_tail);
+        pthread_mutex_unlock(&wsq_mtx);
+
+        if(mlen>0)
+            lws_write(wsi,(unsigned char*)(msg+LWS_PRE),mlen,LWS_WRITE_TEXT);
+        if(more)
             lws_callback_on_writable(wsi);
-            break;
+        break;
+    }
 
-        case LWS_CALLBACK_CLIENT_WRITEABLE: {
-            pthread_mutex_lock(&ws_mutex);
-            char msg[8192];
-            int  mlen = 0;
+    case LWS_CALLBACK_CLIENT_RECEIVE: {
+        char *j = (char*)in;
+        char  type[32]={0};
+        jstr(j,"type",type,sizeof(type));
 
-            if (ws_send_len > 0) {
-                /* queued message waiting */
-                mlen = ws_send_len;
-                memcpy(msg + LWS_PRE, ws_send_buf, mlen);
-                ws_send_len = 0;
-            } else {
-                /* default: send auth on first connect */
-                mlen = snprintf(msg + LWS_PRE, sizeof(msg) - LWS_PRE,
-                    "{\"type\":\"admin_auth\",\"secret\":\"%s\"}", WS_SECRET);
-            }
-            pthread_mutex_unlock(&ws_mutex);
-
-            if (mlen > 0)
-                lws_write(wsi, (unsigned char*)(msg + LWS_PRE), mlen, LWS_WRITE_TEXT);
-
-            /* check if more to send */
-            pthread_mutex_lock(&ws_mutex);
-            int more = ws_send_products || ws_send_len > 0;
-            pthread_mutex_unlock(&ws_mutex);
-            if (more) lws_callback_on_writable(wsi);
-            break;
+        if(!strcmp(type,"state")||!strcmp(type,"ack")){
+            char cnt[16]={0}; jstr(j,"orderCount",cnt,sizeof(cnt));
+            ws_orders = atoi(cnt);
+            ws_state  = WS_READY;
+            wev_push(WEV_SYNCED, NULL);
         }
-
-        case LWS_CALLBACK_CLIENT_RECEIVE: {
-            char *json = (char*)in;
-            char  type[32] = {0};
-            json_str(json, "type", type, sizeof(type));
-
-            if (strcmp(type, "state") == 0 || strcmp(type, "ack") == 0) {
-                char cnt[16] = {0};
-                if (json_str(json, "orderCount", cnt, sizeof(cnt)))
-                    ws_orders = atoi(cnt);
-                set_status("WebSocket ready — products synced with live site.");
-            }
-            else if (strcmp(type, "new_order") == 0) {
-                pthread_mutex_lock(&ws_mutex);
-                ws_orders++;
-                json_str(json, "name",  ws_notif.name,       sizeof(ws_notif.name));
-                json_str(json, "city",  ws_notif.city,       sizeof(ws_notif.city));
-                json_str(json, "total", ws_notif.total,      sizeof(ws_notif.total));
-                char cnt[16] = {0};
-                if (json_str(json, "orderCount", cnt, sizeof(cnt)))
-                    ws_orders = atoi(cnt);
-                snprintf(ws_notif.items_text, sizeof(ws_notif.items_text),
-                         "Total: $%s", ws_notif.total);
-                ws_notif.visible  = 1;
-                ws_notif.shown_at = SDL_GetTicks();
-                pthread_mutex_unlock(&ws_mutex);
-                set_status("New order received!");
-            }
-            else if (strcmp(type, "order_count") == 0) {
-                char cnt[16] = {0};
-                json_str(json, "count", cnt, sizeof(cnt));
-                ws_orders = atoi(cnt);
-            }
-            break;
+        else if(!strcmp(type,"new_order")){
+            pthread_mutex_lock(&notif_mtx);
+            char cnt[16]={0};
+            jstr(j,"name",  notif.name,  sizeof(notif.name));
+            jstr(j,"city",  notif.city,  sizeof(notif.city));
+            jstr(j,"total", notif.total, sizeof(notif.total));
+            jstr(j,"orderCount",cnt,sizeof(cnt));
+            ws_orders   = atoi(cnt);
+            notif.order_no = ws_orders;
+            notif.on    = 1;
+            notif.at    = SDL_GetTicks();
+            pthread_mutex_unlock(&notif_mtx);
+            wev_push(WEV_ORDER, NULL);
         }
+        else if(!strcmp(type,"order_count")){
+            char cnt[16]={0}; jstr(j,"count",cnt,sizeof(cnt));
+            ws_orders = atoi(cnt);
+        }
+        /* check if more data pending */
+        if(lws_remaining_packet_payload(wsi)) lws_callback_on_writable(wsi);
+        break;
+    }
 
-        case LWS_CALLBACK_CLIENT_CONNECTION_ERROR:
-        case LWS_CALLBACK_CLIENT_CLOSED:
-            pthread_mutex_lock(&ws_mutex);
-            ws_state = WS_DISCONNECTED;
-            ws_wsi   = NULL;
-            pthread_mutex_unlock(&ws_mutex);
-            set_status("WebSocket disconnected — retrying...");
-            break;
+    case LWS_CALLBACK_CLIENT_CONNECTION_ERROR:
+    case LWS_CALLBACK_CLIENT_CLOSED:
+        ws_wsi   = NULL;
+        ws_state = WS_OFF;
+        wev_push(WEV_DISCONNECTED, NULL);
+        break;
 
-        default: break;
+    default: break;
     }
     return 0;
 }
 
-static struct lws_protocols ws_protocols[] = {
-    { "perfume-store", ws_callback, 0, 65536, 0, NULL, 0 },
+static struct lws_protocols ws_protos[] = {
+    {"perfume-store", ws_cb, 0, 65536, 0, NULL, 0},
     LWS_PROTOCOL_LIST_TERM
 };
 
-/* send queued message */
-static void ws_queue_send(const char *json) {
-    pthread_mutex_lock(&ws_mutex);
-    int len = (int)strlen(json);
-    if (len < (int)sizeof(ws_send_buf)) {
-        memcpy(ws_send_buf, json, len);
-        ws_send_len = len;
+static void *ws_thread(void *arg){
+    (void)arg;
+    Uint32 last_try = 0;
+    static int authed_flag = 0;   /* reset on each reconnect */
+
+    while(ws_running){
+        if(ws_ctx) lws_service(ws_ctx, 50);
+
+        /* reconnect logic */
+        Uint32 now = SDL_GetTicks();
+        if(ws_state==WS_OFF && now-last_try > 5000){
+            last_try = now;
+            authed_flag = 0;
+
+            struct lws_client_connect_info cc; memset(&cc,0,sizeof(cc));
+            cc.context     = ws_ctx;
+            cc.address     = WS_HOST;
+            cc.port        = WS_PORT;
+            cc.path        = WS_PATH;
+            cc.host        = WS_HOST;
+            cc.origin      = WS_HOST;
+            cc.protocol    = "perfume-store";
+            cc.ssl_connection = LCCSCF_USE_SSL
+                              | LCCSCF_ALLOW_SELFSIGNED
+                              | LCCSCF_SKIP_SERVER_CERT_HOSTNAME_CHECK;
+
+            ws_state = WS_CONN;
+            struct lws *w = lws_client_connect_via_info(&cc);
+            if(!w){ ws_state = WS_OFF; }
+        }
+
+        /* if queued sends, wake up writable */
+        pthread_mutex_lock(&wsq_mtx);
+        int has = (wsq_head != wsq_tail);
+        pthread_mutex_unlock(&wsq_mtx);
+        if(has && ws_wsi) lws_callback_on_writable(ws_wsi);
     }
-    pthread_mutex_unlock(&ws_mutex);
-    if (ws_wsi) lws_callback_on_writable(ws_wsi);
+    if(ws_ctx) lws_context_destroy(ws_ctx);
+    return NULL;
 }
 
-static void ws_sync_products(void) {
-    if (ws_state != WS_CONNECTED) {
-        set_status("Not connected to WebSocket server");
-        return;
-    }
+static void ws_send_products(void){
+    if(ws_state != WS_READY){ set_st("WebSocket not connected yet"); return; }
     char json[8192];
-    build_products_json(json, sizeof(json));
-    ws_queue_send(json);
-    set_status("Products synced to live website via WebSocket!");
-}
-
-static void ws_init(void) {
-    struct lws_context_creation_info info;
-    memset(&info, 0, sizeof(info));
-    info.port      = CONTEXT_PORT_NO_LISTEN;
-    info.protocols = ws_protocols;
-    info.options   = LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
-    lws_set_log_level(0, NULL);
-    ws_ctx = lws_create_context(&info);
-}
-
-static void ws_connect(void) {
-    if (!ws_ctx || ws_state != WS_DISCONNECTED) return;
-
-    struct lws_client_connect_info ccinfo;
-    memset(&ccinfo, 0, sizeof(ccinfo));
-    ccinfo.context      = ws_ctx;
-    ccinfo.address      = WS_HOST;
-    ccinfo.port         = WS_PORT;
-    ccinfo.path         = WS_PATH;
-    ccinfo.host         = WS_HOST;
-    ccinfo.origin       = WS_HOST;
-    ccinfo.protocol     = "perfume-store";
-    ccinfo.ssl_connection = LCCSCF_USE_SSL |
-                            LCCSCF_ALLOW_SELFSIGNED |
-                            LCCSCF_SKIP_SERVER_CERT_HOSTNAME_CHECK;
-
-    ws_state = WS_CONNECTING;
-    ws_wsi   = lws_client_connect_via_info(&ccinfo);
-    if (!ws_wsi) ws_state = WS_DISCONNECTED;
-}
-
-/* ── reconnect timer ── */
-static Uint32 ws_last_try = 0;
-static void ws_tick(void) {
-    if (!ws_ctx) return;
-    lws_service(ws_ctx, 0);
-
-    Uint32 now = SDL_GetTicks();
-    if (ws_state == WS_DISCONNECTED && now - ws_last_try > 5000) {
-        ws_last_try = now;
-        ws_connect();
+    int  pos = 0;
+    pos += snprintf(json+pos, sizeof(json)-pos,
+        "{\"type\":\"update_products\",\"secret\":\"%s\",\"products\":[", WS_SECRET);
+    for(int i=0;i<np&&pos<(int)sizeof(json)-512;i++){
+        Prod *p=&prods[i];
+        char bj[48],ij[280];
+        if(p->badge[0]) snprintf(bj,sizeof(bj),"\"%s\"",p->badge); else strcpy(bj,"null");
+        if(p->image[0]) snprintf(ij,sizeof(ij),"\"%s\"",p->image); else strcpy(ij,"null");
+        pos += snprintf(json+pos, sizeof(json)-pos,
+            "{\"id\":%d,\"name\":\"%s\",\"desc\":\"%s\","
+            "\"price\":%s,\"size\":\"%s\",\"icon\":\"%s\","
+            "\"badge\":%s,\"image\":%s}%s",
+            p->id,p->name,p->desc,
+            p->price[0]?p->price:"0",
+            p->size,p->icon[0]?p->icon:"🌺",
+            bj,ij, i<np-1?",":"");
     }
+    snprintf(json+pos, sizeof(json)-pos,"]}");
+    wsq_push(json);
+    set_st("Syncing products to live website...");
 }
 
-/* ═══════════════════════════════════════════════════════════════════
-   File browser
-   ═══════════════════════════════════════════════════════════════════ */
-static int is_image_ext(const char *name) {
-    const char *ext = strrchr(name, '.');
-    if (!ext) return 0;
-    ext++;
-    return strcasecmp(ext, "jpg")  == 0 ||
-           strcasecmp(ext, "jpeg") == 0 ||
-           strcasecmp(ext, "png")  == 0 ||
-           strcasecmp(ext, "gif")  == 0 ||
-           strcasecmp(ext, "webp") == 0 ||
-           strcasecmp(ext, "bmp")  == 0 ||
-           strcasecmp(ext, "tga")  == 0;
+/* ═══════════════════════════════════════════════════════════════
+   Image
+   ═══════════════════════════════════════════════════════════════ */
+static void img_free(void){
+    if(imgtex){ SDL_DestroyTexture(imgtex); imgtex=NULL; }
+}
+static void img_load(const char *path){
+    img_free();
+    if(!path||!path[0]) return;
+    SDL_Surface *s=IMG_Load(path);
+    if(!s){ char full[512]; snprintf(full,sizeof(full),"%s/%s",GIT_DIR,path); s=IMG_Load(full); }
+    if(!s) return;
+    imgw=s->w; imgh=s->h;
+    imgtex=SDL_CreateTextureFromSurface(gren,s); SDL_FreeSurface(s);
+}
+static int img_is(const char *n){
+    const char *e=strrchr(n,'.'); if(!e) return 0; e++;
+    return !strcasecmp(e,"jpg")||!strcasecmp(e,"jpeg")||!strcasecmp(e,"png")
+          ||!strcasecmp(e,"gif")||!strcasecmp(e,"webp")||!strcasecmp(e,"bmp");
+}
+static int img_copy(const char *src,char *rel,int relsz){
+    mkdir(IMG_DIR,0755);
+    const char *b=strrchr(src,'/'); b=b?b+1:src;
+    char dst[512]; snprintf(dst,sizeof(dst),"%s/%s",IMG_DIR,b);
+    FILE *fi=fopen(src,"rb"); if(!fi) return 0;
+    FILE *fo=fopen(dst,"wb"); if(!fo){ fclose(fi); return 0; }
+    char buf[8192]; size_t n;
+    while((n=fread(buf,1,sizeof(buf),fi))>0) fwrite(buf,1,n,fo);
+    fclose(fi); fclose(fo);
+    snprintf(rel,relsz,"images/%s",b); return 1;
 }
 
-static int fb_cmp(const void *a, const void *b) {
-    const FBEntry *ea = (const FBEntry *)a;
-    const FBEntry *eb = (const FBEntry *)b;
-    if (ea->is_dir != eb->is_dir) return eb->is_dir - ea->is_dir;
-    return strcasecmp(ea->name, eb->name);
-}
-
-static void fb_scan(const char *path) {
-    fb.count  = 0;
-    fb.scroll = 0;
-
-    DIR *d = opendir(path);
-    if (!d) return;
-
-    struct dirent *ent;
-    while ((ent = readdir(d)) && fb.count < FB_MAX) {
-        if (strcmp(ent->d_name, ".") == 0) continue;
-
-        char full[512];
-        snprintf(full, sizeof(full), "%s/%s", path, ent->d_name);
-
-        struct stat st;
-        if (stat(full, &st) != 0) continue;
-
-        int is_dir = S_ISDIR(st.st_mode);
-        if (!is_dir && !is_image_ext(ent->d_name)) continue;
-        /* skip hidden files but allow ".." */
-        if (ent->d_name[0] == '.' && strcmp(ent->d_name, "..") != 0) continue;
-
-        FBEntry *e = &fb.entries[fb.count++];
-        strncpy(e->name,     ent->d_name, sizeof(e->name) - 1);
-        strncpy(e->fullpath, full,        sizeof(e->fullpath) - 1);
-        e->is_dir = is_dir;
-    }
-    closedir(d);
-
-    qsort(fb.entries, fb.count, sizeof(FBEntry), fb_cmp);
-    fb.hovered  = -1;
-    fb.selected = -1;
-}
-
-static void fb_navigate(const char *path) {
-    strncpy(fb.path, path, sizeof(fb.path) - 1);
-    fb.path[sizeof(fb.path)-1] = '\0';
-    fb_scan(path);
-}
-
-static void fb_open(void) {
-    fb.open = 1;
-    const char *home = getenv("HOME");
-    fb_navigate(home ? home : "/home");
-
-    /* layout */
-    int fw = 700, fh = 480;
-    fb.rect      = (SDL_Rect){ (WIN_W-fw)/2, (WIN_H-fh)/2, fw, fh };
-    fb.list_rect = (SDL_Rect){
-        fb.rect.x + 1,
-        fb.rect.y + 78,
-        fw - 2,
-        fh - 78 - 52
-    };
-}
-
-/* visible item count */
-static int fb_vis(void) { return fb.list_rect.h / FB_ITEM_H; }
-
-static void fb_draw(void) {
-    /* dim background */
-    SDL_SetRenderDrawBlendMode(gren, SDL_BLENDMODE_BLEND);
-    SDL_SetRenderDrawColor(gren, 0, 0, 0, 170);
-    SDL_RenderFillRect(gren, NULL);
-    SDL_SetRenderDrawBlendMode(gren, SDL_BLENDMODE_NONE);
-
-    SDL_Rect r = fb.rect;
-
-    /* dialog background */
-    frect(r, (SDL_Color){18, 18, 18, 255});
-    drect(r, C_GOLD);
-
-    /* title bar */
-    SDL_Rect title_r = {r.x, r.y, r.w, 38};
-    frect(title_r, (SDL_Color){28, 28, 28, 255});
-    hline(r.x, r.x + r.w, r.y + 38, C_BDR);
-    dtext("Select Image", r.x + PAD, r.y + 10, gflg, C_GOLD);
-
-    /* close button */
-    SDL_Rect close_btn = {r.x + r.w - 36, r.y + 4, 30, 30};
-    frect(close_btn, C_RED);
-    dtext_center("X", close_btn, gfnt, C_TEXT);
-
-    /* path bar */
-    SDL_Rect path_r = {r.x, r.y + 38, r.w, 40};
-    frect(path_r, (SDL_Color){22, 22, 22, 255});
-    hline(r.x, r.x + r.w, r.y + 78, C_BDR);
-
-    /* up button */
-    SDL_Rect up_btn  = {r.x + r.w - 80, r.y + 46, 34, 24};
-    SDL_Rect hom_btn = {r.x + r.w - 42, r.y + 46, 34, 24};
-    frect(up_btn,  C_CARD); drect(up_btn,  C_BDR);
-    frect(hom_btn, C_CARD); drect(hom_btn, C_BDR);
-    dtext_center("↑",  up_btn,  gfnt, C_TEXT);
-    dtext_center("⌂",  hom_btn, gfnt, C_GOLD);
-
-    /* current path (clipped) */
-    SDL_Rect path_clip = {r.x + PAD, r.y + 46, r.w - 100, 24};
-    dtext_clip(fb.path, path_clip, gfsm, C_MUTE);
-
-    /* ── list ── */
-    SDL_RenderSetClipRect(gren, &fb.list_rect);
-
-    int vis   = fb_vis();
-    int start = fb.scroll;
-    int end   = start + vis;
-    if (end > fb.count) end = fb.count;
-
-    for (int i = start; i < end; i++) {
-        FBEntry *e = &fb.entries[i];
-        int iy = fb.list_rect.y + (i - start) * FB_ITEM_H;
-        SDL_Rect ir = {fb.list_rect.x, iy, fb.list_rect.w, FB_ITEM_H};
-
-        SDL_Color bg = (i == fb.selected) ? C_FBSEL :
-                       (i == fb.hovered)  ? C_FBHOV : C_BG;
-        frect(ir, bg);
-        hline(ir.x, ir.x + ir.w, iy + FB_ITEM_H - 1, C_BDR);
-
-        /* icon: colored slash for dir, dot for image */
-        SDL_Color nc = e->is_dir ? C_GOLD : C_TEXT;
-        const char *icon = e->is_dir ? "/" : "-";
-        dtext(icon, ir.x + 10, iy + (FB_ITEM_H - 14) / 2, gfnt,
-              e->is_dir ? C_GOLD : C_MUTE);
-
-        /* name — append "/" to dirs for clarity */
-        char display[258];
-        if (e->is_dir) snprintf(display, sizeof(display), "%s/", e->name);
-        else           strncpy(display, e->name, sizeof(display) - 1);
-        SDL_Rect nc_clip = {ir.x + 26, iy, ir.w - 30, FB_ITEM_H};
-        dtext_clip(display, nc_clip, gfnt, nc);
-    }
-    SDL_RenderSetClipRect(gren, NULL);
-
-    /* scrollbar */
-    if (fb.count > vis) {
-        int sb_x  = r.x + r.w - 8;
-        int sb_h  = fb.list_rect.h;
-        int sb_y  = fb.list_rect.y;
-        float pct = (float)fb.scroll / (fb.count - vis);
-        int   th  = sb_h * vis / fb.count;
-        int   ty  = sb_y + (int)(pct * (sb_h - th));
-        SDL_Rect sb_bg  = {sb_x, sb_y,  6, sb_h};
-        SDL_Rect sb_thr = {sb_x, ty,    6, th  };
-        frect(sb_bg,  C_CARD);
-        frect(sb_thr, C_MUTE);
-    }
-
-    /* separator */
-    hline(r.x, r.x + r.w, r.y + r.h - 52, C_BDR);
-
-    /* bottom buttons */
-    int bbw = 160, bbh = 34;
-    int bby = r.y + r.h - 43;
-
-    /* paste clipboard */
-    SDL_Rect paste_btn = {r.x + PAD, bby, bbw, bbh};
-    frect(paste_btn, C_PURP); drect(paste_btn, C_BDR);
-    dtext_center("Paste Clipboard", paste_btn, gfsm, C_TEXT);
-
-    /* open / cancel */
-    SDL_Rect open_btn   = {r.x + r.w - PAD - bbw,       bby, bbw, bbh};
-    SDL_Rect cancel_btn = {r.x + r.w - PAD - bbw*2 - 8, bby, bbw, bbh};
-    SDL_Color open_col  = fb.selected >= 0 ? C_GRN
-                                           : (SDL_Color){40,60,40,255};
-    frect(open_btn,   open_col);  drect(open_btn,   C_BDR);
-    frect(cancel_btn, C_RED);     drect(cancel_btn, C_BDR);
-    dtext_center("Open",   open_btn,   gfnt, C_TEXT);
-    dtext_center("Cancel", cancel_btn, gfnt, C_TEXT);
-
-    /* hint when nothing selected */
-    if (fb.selected < 0) {
-        dtext("Click an image file to select it",
-              r.x + PAD + bbw + 12, bby + 10, gfsm, C_MUTE);
-    } else {
-        SDL_Rect hint = {r.x + PAD + bbw + 12, bby, r.w - PAD*3 - bbw*2 - 20, bbh};
-        dtext_clip(fb.entries[fb.selected].name, hint, gfsm, C_GOLD);
-    }
-}
-
-/* ═══════════════════════════════════════════════════════════════════
-   Clipboard paste
-   ═══════════════════════════════════════════════════════════════════ */
-static void free_img(void);
-static void load_preview(const char *path);
-static int  copy_image(const char *src, char *dest_rel, int dest_sz);
-
-static void try_paste_clipboard(void) {
-    /* 1) text clipboard → check if it's a valid image file path */
-    char *clip = SDL_GetClipboardText();
-    if (clip && clip[0]) {
-        /* trim whitespace/newlines */
-        char path[512];
-        strncpy(path, clip, sizeof(path) - 1);
-        path[sizeof(path)-1] = '\0';
-        int l = (int)strlen(path);
-        while (l > 0 && (path[l-1] == '\n' || path[l-1] == '\r' || path[l-1] == ' '))
-            path[--l] = '\0';
-
-        if (access(path, F_OK) == 0 && is_image_ext(path)) {
-            char dest_rel[256];
-            if (copy_image(path, dest_rel, sizeof(dest_rel))) {
-                strncpy(prods[sel].image, dest_rel, sizeof(prods[sel].image) - 1);
-                load_preview(dest_rel);
-                dirty = 1;
-                fb.open = 0;
-                SDL_free(clip);
-                set_status("Image set from clipboard path!");
-                return;
+/* ═══════════════════════════════════════════════════════════════
+   HTML parse / save
+   ═══════════════════════════════════════════════════════════════ */
+static int exfield(const char *blk,const char *key,char *out,int sz){
+    /* match "key": (JSON) or unquoted key: (JS object literal) */
+    char qk[80]; snprintf(qk,sizeof(qk),"\"%s\"",key);
+    const char *p=strstr(blk,qk);
+    if(p){ p+=strlen(qk); }
+    else {
+        /* look for non-alnum + key + : */
+        const char *q=blk; int kl=(int)strlen(key);
+        while(*q){
+            if(!isalnum((unsigned char)*q)&&*q!='_'){
+                if(!strncmp(q+1,key,kl)&&q[1+kl]==':'){p=q+1+kl; break;}
             }
+            q++;
         }
-        SDL_free(clip);
     }
+    if(!p) return 0;
+    while(*p==':'||*p==' ')p++;
+    if(*p=='"'){ p++; int i=0; while(*p&&*p!='"'&&i<sz-1) out[i++]=*p++; out[i]=0; return 1; }
+    if(!strncmp(p,"null",4)){ out[0]=0; return 1; }
+    int i=0; while(*p&&*p!=','&&*p!='}'&&*p!='\n'&&*p!='\r'&&i<sz-1) out[i++]=*p++;
+    while(i>0&&isspace((unsigned char)out[i-1])) i--; out[i]=0; return 1;
+}
 
-    /* 2) image data from X clipboard via xclip (png) */
-    const char *tmp_png = "/tmp/_cb_img.png";
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd),
-        "xclip -selection clipboard -t image/png -o > %s 2>/dev/null", tmp_png);
-    if (system(cmd) == 0 && access(tmp_png, F_OK) == 0) {
-        struct stat st;
-        stat(tmp_png, &st);
-        if (st.st_size > 0) {
-            char dest_rel[256];
-            if (copy_image(tmp_png, dest_rel, sizeof(dest_rel))) {
-                strncpy(prods[sel].image, dest_rel, sizeof(prods[sel].image) - 1);
-                load_preview(dest_rel);
-                dirty = 1;
-                fb.open = 0;
-                set_status("Image pasted from clipboard!");
-                return;
+static void html_load(void){
+    FILE *f=fopen(HTML_PATH,"r"); if(!f){ set_st("ERROR: Cannot open index.html"); return; }
+    char *buf=malloc(BUF_MAX); if(!buf){ fclose(f); return; }
+    int sz=(int)fread(buf,1,BUF_MAX-1,f); buf[sz]=0; fclose(f);
+
+    /* parse brands array */
+    nb=0;
+    char *ba=strstr(buf,"let brands = [");
+    if(ba){
+        ba+=strlen("let brands = [");
+        char *be=strstr(ba,"\n  ];"); if(!be) be=strstr(ba,"];");
+        if(be){
+            char *q=ba;
+            while(q<be&&nb<MAX_BRANDS){
+                char *qs=strchr(q,'"'); if(!qs||qs>=be) break;
+                qs++;
+                char *qe=strchr(qs,'"'); if(!qe||qe>=be) break;
+                int l=(int)(qe-qs); if(l>47) l=47;
+                memcpy(brands[nb],qs,l); brands[nb][l]=0; nb++;
+                q=qe+1;
             }
         }
     }
-
-    /* 3) try jpeg */
-    const char *tmp_jpg = "/tmp/_cb_img.jpg";
-    snprintf(cmd, sizeof(cmd),
-        "xclip -selection clipboard -t image/jpeg -o > %s 2>/dev/null", tmp_jpg);
-    if (system(cmd) == 0 && access(tmp_jpg, F_OK) == 0) {
-        struct stat st;
-        stat(tmp_jpg, &st);
-        if (st.st_size > 0) {
-            char dest_rel[256];
-            if (copy_image(tmp_jpg, dest_rel, sizeof(dest_rel))) {
-                strncpy(prods[sel].image, dest_rel, sizeof(prods[sel].image) - 1);
-                load_preview(dest_rel);
-                dirty = 1;
-                fb.open = 0;
-                set_status("Image pasted from clipboard!");
-                return;
-            }
-        }
+    /* defaults if no brands found */
+    if(nb==0){
+        nb=6;
+        strcpy(brands[0],"Lattafa"); strcpy(brands[1],"Afnan");
+        strcpy(brands[2],"Armaf");   strcpy(brands[3],"Zakat");
+        strcpy(brands[4],"Al Maission"); strcpy(brands[5],"Alhambra");
     }
 
-    set_status("Clipboard: no image found. Copy an image or a file path first.");
-}
+    /* parse products array */
+    np=0; nxtid=1;
+    char *arr=strstr(buf,"let products = [");
+    if(!arr){ set_st("ERROR: products array not found"); free(buf); return; }
+    arr+=strlen("let products = [");
 
-/* ═══════════════════════════════════════════════════════════════════
-   HTML parsing
-   ═══════════════════════════════════════════════════════════════════ */
-static int extract_field(const char *blk, const char *key, char *out, int outsz) {
-    const char *p = strstr(blk, key);
-    if (!p) return 0;
-    p += strlen(key);
-    while (*p == ' ' || *p == ':') p++;
-    if (*p == '"') {
-        p++;
-        int i = 0;
-        while (*p && *p != '"' && i < outsz - 1) out[i++] = *p++;
-        out[i] = '\0';
-        return 1;
-    }
-    if (strncmp(p, "null", 4) == 0) { out[0] = '\0'; return 1; }
-    int i = 0;
-    while (*p && *p != ',' && *p != '\n' && *p != '\r' && i < outsz - 1)
-        out[i++] = *p++;
-    out[i] = '\0';
-    while (i > 0 && isspace((unsigned char)out[i-1])) out[--i] = '\0';
-    return 1;
-}
+    char *arr_end=strstr(arr,"\n  ];"); if(!arr_end) arr_end=strstr(arr,"\n  ]");
+    if(!arr_end){ free(buf); set_st("ERROR: products end not found"); return; }
 
-static void load_html(void) {
-    FILE *f = fopen(HTML_PATH, "r");
-    if (!f) { set_status("ERROR: Cannot open index.html"); return; }
-    char *buf = malloc(BUF_MAX);
-    if (!buf) { fclose(f); return; }
-    int sz = (int)fread(buf, 1, BUF_MAX - 1, f);
-    buf[sz] = '\0';
-    fclose(f);
-
-    np = 0; nxtid = 1;
-
-    char *arr = strstr(buf, "const products = [");
-    if (!arr) { set_status("ERROR: products array not found"); free(buf); return; }
-    arr += strlen("const products = [");
-
-    char *arr_end = strstr(arr, "\n  ];");
-    if (!arr_end) arr_end = strstr(arr, "\n  ]");
-    if (!arr_end) { free(buf); return; }
-
-    char *p = arr;
-    while (p < arr_end && np < MAX_PRODS) {
-        char *ob = strchr(p, '{');
-        if (!ob || ob >= arr_end) break;
-
-        int depth = 1; char *cb = ob + 1;
-        while (*cb && depth) { if (*cb=='{') depth++; else if(*cb=='}') depth--; cb++; }
-
-        int blen = (int)(cb - ob);
-        char *blk = malloc(blen + 1);
-        memcpy(blk, ob, blen); blk[blen] = '\0';
-
-        Prod *pr = &prods[np];
-        memset(pr, 0, sizeof(Prod));
-
+    char *p=arr;
+    while(p<arr_end&&np<MAX_PRODS){
+        char *ob=strchr(p,'{'); if(!ob||ob>=arr_end) break;
+        int depth=1; char *cb=ob+1;
+        while(*cb&&depth){ if(*cb=='{')depth++; else if(*cb=='}')depth--; cb++; }
+        int bl=(int)(cb-ob); char *blk=malloc(bl+1);
+        memcpy(blk,ob,bl); blk[bl]=0;
+        Prod *pr=&prods[np]; memset(pr,0,sizeof(Prod));
         char tmp[32];
-        if (extract_field(blk, "id", tmp, sizeof(tmp))) pr->id = atoi(tmp);
-        extract_field(blk, "name",  pr->name,  sizeof(pr->name));
-        extract_field(blk, "desc",  pr->desc,  sizeof(pr->desc));
-        extract_field(blk, "price", pr->price, sizeof(pr->price));
-        extract_field(blk, "size",  pr->size,  sizeof(pr->size));
-        extract_field(blk, "badge", pr->badge, sizeof(pr->badge));
-        extract_field(blk, "icon",  pr->icon,  sizeof(pr->icon));
-        extract_field(blk, "image", pr->image, sizeof(pr->image));
-
-        if (strcmp(pr->badge, "null") == 0) pr->badge[0] = '\0';
-        if (strcmp(pr->image, "null") == 0) pr->image[0] = '\0';
-
-        if (pr->id >= nxtid) nxtid = pr->id + 1;
-        if (pr->name[0]) np++;
-        free(blk);
-        p = cb;
+        if(exfield(blk,"id",tmp,sizeof(tmp))) pr->id=atoi(tmp);
+        exfield(blk,"name", pr->name, sizeof(pr->name));
+        exfield(blk,"desc", pr->desc, sizeof(pr->desc));
+        exfield(blk,"price",pr->price,sizeof(pr->price));
+        exfield(blk,"size", pr->size, sizeof(pr->size));
+        exfield(blk,"badge",pr->badge,sizeof(pr->badge));
+        exfield(blk,"icon", pr->icon, sizeof(pr->icon));
+        exfield(blk,"image",pr->image,sizeof(pr->image));
+        exfield(blk,"brand",pr->brand,sizeof(pr->brand));
+        if(!strcmp(pr->badge,"null")) pr->badge[0]=0;
+        if(!strcmp(pr->image,"null")) pr->image[0]=0;
+        if(!strcmp(pr->brand,"null")) pr->brand[0]=0;
+        if(pr->id>=nxtid) nxtid=pr->id+1;
+        if(pr->name[0]) np++;
+        free(blk); p=cb;
     }
     free(buf);
-
-    char msg[64];
-    snprintf(msg, sizeof(msg), "Loaded %d products from index.html", np);
-    set_status(msg);
-    dirty = 0;
+    char msg[80]; snprintf(msg,sizeof(msg),"Loaded %d products, %d brands",np,nb);
+    set_st(msg); dirty=0;
 }
 
-/* ═══════════════════════════════════════════════════════════════════
-   HTML saving
-   ═══════════════════════════════════════════════════════════════════ */
-static void fix_render_template(char *buf) {
-    const char *old = "<span>${p.icon}</span>";
-    const char *nw  =
-        "${p.image ? `<img src=\"${p.image}\" alt=\"${p.name}\" />` : `<span>${p.icon}</span>`}";
-    char *pos = strstr(buf, old);
-    if (!pos) return;
-    int ol = (int)strlen(old), nl = (int)strlen(nw);
-    memmove(pos + nl, pos + ol, strlen(pos + ol) + 1);
-    memcpy(pos, nw, nl);
+static void fix_tpl(char *buf){
+    const char *old="<span>${p.icon}</span>";
+    const char *nw ="${p.image?`<img src=\"${p.image}\" alt=\"${p.name}\" />`:`<span>${p.icon}</span>`}";
+    char *pos=strstr(buf,old); if(!pos) return;
+    int ol=strlen(old),nl=strlen(nw);
+    memmove(pos+nl,pos+ol,strlen(pos+ol)+1);
+    memcpy(pos,nw,nl);
 }
 
-static void save_html(void) {
-    FILE *f = fopen(HTML_PATH, "r");
-    if (!f) { set_status("ERROR: Cannot open index.html"); return; }
-    char *buf = malloc(BUF_MAX * 2);
-    if (!buf) { fclose(f); return; }
-    int sz = (int)fread(buf, 1, BUF_MAX - 1, f);
-    buf[sz] = '\0';
-    fclose(f);
+static void html_save(void){
+    FILE *f=fopen(HTML_PATH,"r");
+    if(!f){ set_st("ERROR: Cannot open HTML"); return; }
+    char *buf=malloc(BUF_MAX*2); if(!buf){ fclose(f); return; }
+    int sz=(int)fread(buf,1,BUF_MAX-1,f); buf[sz]=0; fclose(f);
 
-    fix_render_template(buf);
-    sz = (int)strlen(buf);  /* recalculate — template fix may expand buf */
+    fix_tpl(buf);
+    sz=(int)strlen(buf);   /* IMPORTANT: update sz after template fix */
 
-    char *arr_start = strstr(buf, "const products = [");
-    if (!arr_start) { set_status("ERROR: products marker not found"); free(buf); return; }
-    arr_start += strlen("const products = [");
+    char *as=strstr(buf,"let products = [");
+    if(!as){ set_st("ERROR: marker not found"); free(buf); return; }
+    as+=strlen("let products = [");
 
-    char *arr_end = strstr(arr_start, "\n  ];");
-    if (!arr_end) { set_status("ERROR: products end not found"); free(buf); return; }
+    char *ae=strstr(as,"\n  ];");
+    if(!ae){ set_st("ERROR: end not found"); free(buf); return; }
 
-    char *newjs = malloc(BUF_MAX);
-    if (!newjs) { free(buf); return; }
-    int pos = 0;
-    pos += snprintf(newjs + pos, BUF_MAX - pos, "\n");
+    char *njs=malloc(BUF_MAX); if(!njs){ free(buf); return; }
 
-    for (int i = 0; i < np; i++) {
-        Prod *pr = &prods[i];
-        char badge_js[64], image_js[300];
-
-        if (pr->badge[0]) snprintf(badge_js, sizeof(badge_js), "\"%s\"", pr->badge);
-        else strcpy(badge_js, "null");
-
-        if (pr->image[0]) snprintf(image_js, sizeof(image_js), "\"%s\"", pr->image);
-        else strcpy(image_js, "null");
-
-        pos += snprintf(newjs + pos, BUF_MAX - pos,
+    /* build new products JS block */
+    int pos=0; pos+=snprintf(njs+pos,BUF_MAX-pos,"\n");
+    for(int i=0;i<np;i++){
+        Prod *p=&prods[i];
+        char bj[80],ij[300],brj[80];
+        if(p->badge[0]) snprintf(bj,sizeof(bj),"\"%s\"",p->badge); else strcpy(bj,"null");
+        if(p->image[0]) snprintf(ij,sizeof(ij),"\"%s\"",p->image); else strcpy(ij,"null");
+        if(p->brand[0]) snprintf(brj,sizeof(brj),"\"%s\"",p->brand); else strcpy(brj,"null");
+        pos+=snprintf(njs+pos,BUF_MAX-pos,
             "    {\n"
             "      id: %d,\n"
             "      name: \"%s\",\n"
@@ -853,719 +598,841 @@ static void save_html(void) {
             "      size: \"%s\",\n"
             "      icon: \"%s\",\n"
             "      badge: %s,\n"
-            "      image: %s\n"
+            "      image: %s,\n"
+            "      brand: %s\n"
             "    }%s\n",
-            pr->id, pr->name, pr->desc,
-            pr->price[0] ? pr->price : "0",
-            pr->size, pr->icon[0] ? pr->icon : "🌺",
-            badge_js, image_js,
-            i < np - 1 ? "," : "");
+            p->id,p->name,p->desc,
+            p->price[0]?p->price:"0",
+            p->size,p->icon[0]?p->icon:"🌹",
+            bj,ij,brj, i<np-1?",":"");
     }
 
-    int blen  = (int)(arr_start - buf);
-    int astart = (int)(arr_end  - buf);
-    int alen   = sz - astart;
+    /* find brands section in original buf to replace it */
+    char *brands_start=strstr(buf,"let brands = [");
+    char *brands_end  = brands_start ? strstr(brands_start,"\n  ];") : NULL;
+    if(brands_start && brands_end){
+        /* build new brands block */
+        char *brnjs=malloc(2048); int bp2=0;
+        bp2+=snprintf(brnjs+bp2,2047,"let brands = [\n");
+        for(int i=0;i<nb;i++)
+            bp2+=snprintf(brnjs+bp2,2047-bp2,"    \"%s\"%s\n",brands[i],i<nb-1?",":"");
+        bp2+=snprintf(brnjs+bp2,2047-bp2,"  ]");
 
-    char *out = malloc(blen + pos + alen + 4);
-    if (!out) { free(buf); free(newjs); return; }
-    memcpy(out, buf, blen);
-    memcpy(out + blen, newjs, pos);
-    memcpy(out + blen + pos, arr_end, alen);
-    out[blen + pos + alen] = '\0';
-
-    f = fopen(HTML_PATH, "w");
-    if (!f) { set_status("ERROR: Cannot write index.html"); free(out); free(buf); free(newjs); return; }
-    fputs(out, f);
-    fclose(f);
-
-    free(out); free(buf); free(newjs);
-    dirty = 0;
-    set_status("Saved! Click 'Push to GitHub' to update the website.");
-}
-
-/* ═══════════════════════════════════════════════════════════════════
-   Image helpers
-   ═══════════════════════════════════════════════════════════════════ */
-static void free_img(void) {
-    if (imgtex) { SDL_DestroyTexture(imgtex); imgtex = NULL; }
-}
-
-static void load_preview(const char *path) {
-    free_img();
-    if (!path || !path[0]) return;
-    SDL_Surface *s = IMG_Load(path);
-    if (!s) {
-        char full[512];
-        snprintf(full, sizeof(full), "%s/%s", GIT_DIR, path);
-        s = IMG_Load(full);
+        int pre=(int)(brands_start-buf);
+        int after_end=(int)strlen(brands_end+strlen("\n  ];")); /* rest after brands ] */
+        /* reconstruct buf with new brands */
+        char *tmp2=malloc(BUF_MAX*2);
+        memcpy(tmp2,buf,pre);
+        memcpy(tmp2+pre,brnjs,bp2);
+        strcpy(tmp2+pre+bp2,brands_end+strlen("\n  ];")-1);
+        /* update buf pointer (re-read needed) */
+        sz=(int)strlen(tmp2); tmp2[sz]=0;
+        free(buf); buf=tmp2; free(brnjs);
+        /* re-find products markers in new buf */
+        fix_tpl(buf); sz=(int)strlen(buf);
+        as=strstr(buf,"let products = [");
+        if(!as){ set_st("ERROR: re-find fail"); free(buf);free(njs); return; }
+        as+=strlen("let products = [");
+        ae=strstr(as,"\n  ];");
+        if(!ae){ set_st("ERROR: re-find end"); free(buf);free(njs); return; }
     }
-    if (!s) return;
-    imgw = s->w; imgh = s->h;
-    imgtex = SDL_CreateTextureFromSurface(gren, s);
-    SDL_FreeSurface(s);
+
+    int blen=(int)(as-buf);
+    int alen=(int)strlen(ae);
+    char *out=malloc(blen+pos+alen+8);
+    if(!out){ free(buf); free(njs); return; }
+    memcpy(out,buf,blen);
+    memcpy(out+blen,njs,pos);
+    memcpy(out+blen+pos,ae,alen);
+    out[blen+pos+alen]=0;
+
+    f=fopen(HTML_PATH,"w");
+    if(!f){ set_st("ERROR: Cannot write HTML"); free(out);free(buf);free(njs); return; }
+    fputs(out,f); fclose(f);
+    free(out); free(buf); free(njs);
+    dirty=0; set_st("HTML saved! Use Push or Sync to publish.");
 }
 
-static int copy_image(const char *src, char *dest_rel, int dest_sz) {
-    mkdir(IMG_DIR, 0755);
-    const char *base = strrchr(src, '/');
-    base = base ? base + 1 : src;
-
-    char dest_abs[512];
-    snprintf(dest_abs, sizeof(dest_abs), "%s/%s", IMG_DIR, base);
-
-    FILE *fin  = fopen(src,      "rb");
-    if (!fin)  return 0;
-    FILE *fout = fopen(dest_abs, "wb");
-    if (!fout) { fclose(fin); return 0; }
-
-    char cbuf[8192]; size_t n;
-    while ((n = fread(cbuf, 1, sizeof(cbuf), fin)) > 0) fwrite(cbuf, 1, n, fout);
-    fclose(fin); fclose(fout);
-
-    snprintf(dest_rel, dest_sz, "images/%s", base);
-    return 1;
-}
-
-/* ═══════════════════════════════════════════════════════════════════
-   Product <-> form sync
-   ═══════════════════════════════════════════════════════════════════ */
-static void tf_set(TF *t, const char *s) {
-    strncpy(t->buf, s ? s : "", sizeof(t->buf) - 1);
-    t->buf[sizeof(t->buf)-1] = '\0';
-    t->len = (int)strlen(t->buf);
-    t->cursor = t->len;
-}
-
-static void fields_from_prod(int i) {
-    if (i < 0 || i >= np) return;
-    Prod *p = &prods[i];
-    tf_set(&tfs[FN], p->name);
-    tf_set(&tfs[FD], p->desc);
-    tf_set(&tfs[FP], p->price);
-    tf_set(&tfs[FS], p->size);
-    tf_set(&tfs[FB_F], p->badge);
-    load_preview(p->image);
-}
-
-static void fields_to_prod(int i) {
-    if (i < 0 || i >= np) return;
-    Prod *p = &prods[i];
-    strncpy(p->name,  tfs[FN].buf,   sizeof(p->name)  - 1);
-    strncpy(p->desc,  tfs[FD].buf,   sizeof(p->desc)  - 1);
-    strncpy(p->price, tfs[FP].buf,   sizeof(p->price) - 1);
-    strncpy(p->size,  tfs[FS].buf,   sizeof(p->size)  - 1);
-    strncpy(p->badge, tfs[FB_F].buf, sizeof(p->badge) - 1);
-    dirty = 1;
-}
-
-/* ═══════════════════════════════════════════════════════════════════
-   Layout
-   ═══════════════════════════════════════════════════════════════════ */
-static void setup_layout(void) {
-    int ry  = WIN_H - BTN_BAR - STAT_H;
-    int rx  = LIST_W + 1;
-    int rw  = WIN_W - rx;
-
-    int bw  = LIST_W / 2 - PAD - 4;
-    btn_add = (SDL_Rect){ PAD,           ry + (BTN_BAR-34)/2, bw, 34 };
-    btn_del = (SDL_Rect){ PAD + bw + 8,  ry + (BTN_BAR-34)/2, bw, 34 };
-
-    int pw  = 164;
-    btn_wssync = (SDL_Rect){ LIST_W+PAD,                         ry + (BTN_BAR-34)/2, pw, 34 };
-    btn_save   = (SDL_Rect){ WIN_W - PAD - pw*2 - 10,            ry + (BTN_BAR-34)/2, pw, 34 };
-    btn_push   = (SDL_Rect){ WIN_W - PAD - pw,                   ry + (BTN_BAR-34)/2, pw, 34 };
-
-    int fx = rx + PAD, fw = rw - PAD * 2;
-    int fy = 60, gap = TF_H + 24;
-
-    tfs[FN].rect = (SDL_Rect){ fx,             fy,        fw,         TF_H };
-    tfs[FD].rect = (SDL_Rect){ fx,             fy+gap,    fw,         TF_H };
-    tfs[FP].rect = (SDL_Rect){ fx,             fy+gap*2,  fw/3,       TF_H };
-    tfs[FS].rect = (SDL_Rect){ fx+fw/3+12,     fy+gap*2,  fw/3-12,    TF_H };
-    tfs[FB_F].rect=(SDL_Rect){ fx+fw*2/3+8,    fy+gap*2,  fw/3-8,     TF_H };
-
-    strncpy(tfs[FN].label,  "Perfume Name", 31);
-    strncpy(tfs[FD].label,  "Description",  31);
-    strncpy(tfs[FP].label,  "Price ($)",    31);
-    strncpy(tfs[FS].label,  "Size",         31);
-    strncpy(tfs[FB_F].label,"Badge",        31);
-
-    strncpy(tfs[FN].hint,   "e.g. Rose Oud",        63);
-    strncpy(tfs[FD].hint,   "Short tagline",         63);
-    strncpy(tfs[FP].hint,   "45",                    63);
-    strncpy(tfs[FS].hint,   "50ml",                  63);
-    strncpy(tfs[FB_F].hint, "New / Best Seller",     63);
-
-    int img_y = fy + gap * 3 + 4;
-    btn_browse = (SDL_Rect){ fx,       img_y, 170, 34 };
-    btn_paste  = (SDL_Rect){ fx + 178, img_y, 170, 34 };
-}
-
-/* ═══════════════════════════════════════════════════════════════════
-   Text field rendering
-   ═══════════════════════════════════════════════════════════════════ */
-static void draw_tf(TF *t, int is_active) {
-    frect(t->rect, C_CARD);
-    drect(t->rect, is_active ? C_GOLD : C_BDR);
-
-    SDL_Rect clip = { t->rect.x + 8, t->rect.y, t->rect.w - 16, t->rect.h };
-    if (t->len > 0) dtext_clip(t->buf,  clip, gfnt, C_TEXT);
-    else            dtext_clip(t->hint, clip, gfnt, C_MUTE);
-
-    if (is_active && (SDL_GetTicks() / 530) % 2 == 0) {
-        int cx = t->rect.x + 8;
-        if (t->cursor > 0) {
-            char tmp[256];
-            int n = t->cursor < t->len ? t->cursor : t->len;
-            memcpy(tmp, t->buf, n); tmp[n] = '\0';
-            int tw, th; TTF_SizeUTF8(gfnt, tmp, &tw, &th);
-            cx += tw;
-        }
-        scol(C_GOLD);
-        SDL_RenderDrawLine(gren, cx, t->rect.y + 5, cx, t->rect.y + t->rect.h - 5);
-    }
-}
-
-/* ═══════════════════════════════════════════════════════════════════
-   Text field input
-   ═══════════════════════════════════════════════════════════════════ */
-static void tf_activate(int idx) {
-    if (atf >= 0 && atf < NFIELDS) tfs[atf].active = 0;
-    if (idx >= 0 && idx < NFIELDS) { tfs[idx].active = 1; tfs[idx].cursor = tfs[idx].len; }
-    atf = idx;
-    SDL_StartTextInput();
-}
-
-static void tf_deactivate(void) {
-    if (atf >= 0 && atf < NFIELDS) tfs[atf].active = 0;
-    atf = -1;
-    SDL_StopTextInput();
-}
-
-static void tf_insert(TF *t, const char *s) {
-    int slen = (int)strlen(s);
-    if (t->len + slen >= (int)sizeof(t->buf)) return;
-    memmove(t->buf + t->cursor + slen, t->buf + t->cursor, t->len - t->cursor + 1);
-    memcpy(t->buf + t->cursor, s, slen);
-    t->len += slen; t->cursor += slen;
-}
-
-static void tf_backspace(TF *t) {
-    if (t->cursor <= 0) return;
-    memmove(t->buf + t->cursor - 1, t->buf + t->cursor, t->len - t->cursor + 1);
-    t->len--; t->cursor--;
-}
-
-static void tf_clear(TF *t) { t->buf[0] = '\0'; t->len = t->cursor = 0; }
-
-/* ═══════════════════════════════════════════════════════════════════
+/* ═══════════════════════════════════════════════════════════════
    Git push
-   ═══════════════════════════════════════════════════════════════════ */
-static void git_push(void) {
-    set_status("Pushing to GitHub...");
-
+   ═══════════════════════════════════════════════════════════════ */
+static void git_push(void){
+    set_st("Pushing to GitHub...");
     char cmd[512];
-    snprintf(cmd, sizeof(cmd),
-        "cd %s && git add -A && git commit -m 'Update products' && git push 2>&1",
-        GIT_DIR);
-
-    FILE *fp = popen(cmd, "r");
-    if (!fp) { set_status("ERROR: popen failed"); return; }
-
-    char line[256], last[256] = {0};
-    while (fgets(line, sizeof(line), fp)) strncpy(last, line, sizeof(last) - 1);
+    snprintf(cmd,sizeof(cmd),
+        "cd %s && git add -A && git commit -m 'Update products' && git push 2>&1",GIT_DIR);
+    FILE *fp=popen(cmd,"r"); if(!fp){ set_st("ERROR: popen failed"); return; }
+    char line[256],last[256]={0};
+    while(fgets(line,sizeof(line),fp)) strncpy(last,line,255);
     pclose(fp);
-
-    int ll = (int)strlen(last);
-    while (ll > 0 && (last[ll-1]=='\n'||last[ll-1]=='\r')) last[--ll] = '\0';
-    set_status(last[0] ? last : "Pushed! Website updated.");
+    int l=strlen(last); while(l>0&&(last[l-1]=='\n'||last[l-1]=='\r')) last[--l]=0;
+    set_st(last[0]?last:"Pushed to GitHub!");
 }
 
-/* ═══════════════════════════════════════════════════════════════════
-   Rendering
-   ═══════════════════════════════════════════════════════════════════ */
-static void draw_button(SDL_Rect r, const char *lbl, SDL_Color bg, SDL_Color fg) {
-    frect(r, bg); drect(r, C_BDR);
-    dtext_center(lbl, r, gfnt, fg);
+/* ═══════════════════════════════════════════════════════════════
+   Product <-> form
+   ═══════════════════════════════════════════════════════════════ */
+static void tf_set(TF *t,const char *s){
+    strncpy(t->buf,s?s:"",255); t->buf[255]=0;
+    t->len=strlen(t->buf); t->cur=t->len;
+}
+static void p2f(int i){
+    if(i<0||i>=np) return;
+    Prod *p=&prods[i];
+    tf_set(&tfs[FN],p->name); tf_set(&tfs[FD],p->desc);
+    tf_set(&tfs[FP],p->price);tf_set(&tfs[FS],p->size);
+    tf_set(&tfs[FB_F],p->badge); tf_set(&tfs[FB_BRAND],p->brand);
+    img_load(p->image);
+}
+static void f2p(int i){
+    if(i<0||i>=np) return;
+    Prod *p=&prods[i];
+    strncpy(p->name, tfs[FN].buf, 63);
+    strncpy(p->desc, tfs[FD].buf,127);
+    strncpy(p->price,tfs[FP].buf, 19);
+    strncpy(p->size, tfs[FS].buf, 15);
+    strncpy(p->badge,tfs[FB_F].buf,31);
+    strncpy(p->brand,tfs[FB_BRAND].buf,47);
+    dirty=1;
 }
 
-static void render(void) {
-    scol(C_BG);
-    SDL_RenderClear(gren);
+/* ═══════════════════════════════════════════════════════════════
+   File browser
+   ═══════════════════════════════════════════════════════════════ */
+static int fb_cmp(const void *a,const void *b){
+    const FBEntry *ea=a,*eb=b;
+    if(ea->is_dir!=eb->is_dir) return eb->is_dir-ea->is_dir;
+    return strcasecmp(ea->name,eb->name);
+}
+static void fb_scan(const char *path){
+    fb.cnt=0; fb.scroll=0; fb.hov=-1; fb.sel2=-1;
+    DIR *d=opendir(path); if(!d) return;
+    struct dirent *e;
+    while((e=readdir(d))&&fb.cnt<FB_MAX){
+        if(!strcmp(e->d_name,".")) continue;
+        if(e->d_name[0]=='.'&&strcmp(e->d_name,"..")) continue;
+        char full[512]; snprintf(full,sizeof(full),"%s/%s",path,e->d_name);
+        struct stat st; if(stat(full,&st)) continue;
+        int isd=S_ISDIR(st.st_mode);
+        if(!isd&&!img_is(e->d_name)) continue;
+        FBEntry *fe=&fb.ents[fb.cnt++];
+        strncpy(fe->name,e->d_name,255); strncpy(fe->path,full,511);
+        fe->is_dir=isd;
+    }
+    closedir(d);
+    qsort(fb.ents,fb.cnt,sizeof(FBEntry),fb_cmp);
+}
+static void fb_go(const char *path){
+    strncpy(fb.path,path,511); fb_scan(path);
+}
+static void fb_open_browser(void){
+    fb.open=1;
+    const char *h=getenv("HOME"); fb_go(h?h:"/home");
+    int fw=720,fh=480;
+    fb.rect=(SDL_Rect){(WIN_W-fw)/2,(WIN_H-fh)/2,fw,fh};
+    fb.list=(SDL_Rect){fb.rect.x+1,fb.rect.y+78,fw-2,fh-78-52};
+}
+static int fb_vis(void){ return fb.list.h/FB_ROW; }
 
-    int bary  = WIN_H - BTN_BAR - STAT_H;
-    int right = LIST_W + 1;
+static void fb_draw(void){
+    SDL_SetRenderDrawBlendMode(gren,SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(gren,0,0,0,160); SDL_RenderFillRect(gren,NULL);
+    SDL_SetRenderDrawBlendMode(gren,SDL_BLENDMODE_NONE);
+
+    SDL_Rect r=fb.rect;
+    fr(r,PANEL); dr(r,GOLD);
+
+    /* title */
+    fr((SDL_Rect){r.x,r.y,r.w,38},CARD);
+    hl(r.x,r.x+r.w,r.y+38,BDR);
+    dt("Select Image File",r.x+PAD,r.y+10,fLG,GOLD);
+
+    SDL_Rect xb={r.x+r.w-34,r.y+4,28,28};
+    fr(xb,RED); dtctr("X",xb,fMD,TEXT);
+
+    /* path bar */
+    fr((SDL_Rect){r.x,r.y+38,r.w,40},C(18,18,18));
+    hl(r.x,r.x+r.w,r.y+78,BDR);
+    SDL_Rect pc={r.x+PAD,r.y+46,r.w-100,24}; dtclip(fb.path,pc,fSM,MUTED);
+    SDL_Rect ub={r.x+r.w-80,r.y+47,32,22}; fr(ub,CARD); dr(ub,BDR); dtctr("Up",ub,fSM,TEXT);
+    SDL_Rect hb={r.x+r.w-44,r.y+47,34,22}; fr(hb,CARD); dr(hb,BDR); dtctr("Home",hb,fSM,GOLD);
+
+    /* list */
+    SDL_RenderSetClipRect(gren,&fb.list);
+    int vis=fb_vis(), end=fb.scroll+vis; if(end>fb.cnt) end=fb.cnt;
+    for(int i=fb.scroll;i<end;i++){
+        FBEntry *e=&fb.ents[i];
+        int iy=fb.list.y+(i-fb.scroll)*FB_ROW;
+        SDL_Rect ir={fb.list.x,iy,fb.list.w,FB_ROW};
+        SDL_Color bg=(i==fb.sel2)?FBSEL:(i==fb.hov)?FBHOV:BG;
+        fr(ir,bg); hl(ir.x,ir.x+ir.w,iy+FB_ROW-1,BDR);
+        const char *icon=e->is_dir?"/":"-";
+        dt(icon,ir.x+8,iy+(FB_ROW-12)/2,fSM,e->is_dir?GOLD:MUTED);
+        char dn[260]; if(e->is_dir) snprintf(dn,sizeof(dn),"%s/",e->name);
+        else strncpy(dn,e->name,259);
+        SDL_Rect nc={ir.x+24,iy,ir.w-28,FB_ROW};
+        dtclip(dn,nc,fMD,e->is_dir?GOLD:TEXT);
+    }
+    SDL_RenderSetClipRect(gren,NULL);
+
+    /* scrollbar */
+    if(fb.cnt>vis){
+        int sbx=r.x+r.w-7,sbh=fb.list.h,sby=fb.list.y;
+        int th=sbh*vis/fb.cnt;
+        int ty=sby+(int)((float)fb.scroll/(fb.cnt-vis)*(sbh-th));
+        fr((SDL_Rect){sbx,sby,5,sbh},CARD);
+        fr((SDL_Rect){sbx,ty,5,th},MUTED);
+    }
+
+    hl(r.x,r.x+r.w,r.y+r.h-52,BDR);
+
+    /* bottom buttons */
+    int bby=r.y+r.h-43,bw=150,bh=34;
+    SDL_Rect pbtn={r.x+PAD,bby,bw,bh};
+    SDL_Rect cbtn={r.x+r.w-PAD-bw*2-8,bby,bw,bh};
+    SDL_Rect obtn={r.x+r.w-PAD-bw,bby,bw,bh};
+    fr(pbtn,BLUE); dr(pbtn,BDR); dtctr("Paste Clipboard",pbtn,fSM,TEXT);
+    fr(cbtn,RED);  dr(cbtn,BDR); dtctr("Cancel",cbtn,fMD,TEXT);
+    SDL_Color oc=fb.sel2>=0?GRN:C(35,55,35);
+    fr(obtn,oc); dr(obtn,BDR); dtctr("Open",obtn,fMD,TEXT);
+    if(fb.sel2<0) dt("Click an image file",r.x+PAD+bw+12,bby+10,fSM,MUTED);
+    else{ SDL_Rect hn={r.x+PAD+bw+12,bby,r.w-PAD*3-bw*3-16,bh}; dtclip(fb.ents[fb.sel2].name,hn,fSM,GOLD); }
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Clipboard paste
+   ═══════════════════════════════════════════════════════════════ */
+static void paste_clip(void){
+    char *clip=SDL_GetClipboardText();
+    if(clip&&clip[0]){
+        char path[512]; strncpy(path,clip,511);
+        int l=strlen(path); while(l>0&&(path[l-1]=='\n'||path[l-1]=='\r'||path[l-1]==' ')) path[--l]=0;
+        if(!access(path,F_OK)&&img_is(path)){
+            char rel[256];
+            if(img_copy(path,rel,sizeof(rel))){
+                strncpy(prods[sel].image,rel,255);
+                img_load(rel); dirty=1; fb.open=0;
+                SDL_free(clip); set_st("Image set from clipboard path!"); return;
+            }
+        }
+        SDL_free(clip);
+    }
+    /* try X clipboard image */
+    const char *tmp="/tmp/_cb.png";
+    if(!system("xclip -selection clipboard -t image/png -o > /tmp/_cb.png 2>/dev/null")){
+        struct stat st; stat(tmp,&st);
+        if(st.st_size>0){
+            char rel[256];
+            if(img_copy(tmp,rel,sizeof(rel))){
+                strncpy(prods[sel].image,rel,255);
+                img_load(rel); dirty=1; fb.open=0;
+                set_st("Image pasted from clipboard!"); return;
+            }
+        }
+    }
+    set_st("Clipboard: no image found. Copy an image or file path first.");
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Layout
+   ═══════════════════════════════════════════════════════════════ */
+static void layout(void){
+    int ry=WIN_H-BAR_H-STAT_H;
+    int rx=LIST_W+1, rw=WIN_W-rx;
+
+    /* left panel buttons */
+    int bw=(LIST_W-PAD*2-8)/2;
+    btn_add   =(SDL_Rect){PAD,     ry+(BAR_H-34)/2, bw,   34};
+    btn_del   =(SDL_Rect){PAD+bw+8,ry+(BAR_H-34)/2, bw,   34};
+    btn_brands=(SDL_Rect){PAD,     ry-42,           LIST_W-PAD*2, 28};
+
+    /* right panel bottom buttons */
+    int pw=138;
+    btn_wssync=(SDL_Rect){rx+PAD,              ry+(BAR_H-34)/2, pw,   34};
+    btn_save  =(SDL_Rect){WIN_W-PAD-pw*2-8,    ry+(BAR_H-34)/2, pw,   34};
+    btn_push  =(SDL_Rect){WIN_W-PAD-pw,         ry+(BAR_H-34)/2, pw,   34};
+
+    /* text fields */
+    int fx=rx+PAD, fw=rw-PAD*2;
+    int fy=56, gap=TF_H+26;
+
+    tfs[FN].rect=(SDL_Rect){fx,         fy,       fw,      TF_H};
+    tfs[FD].rect=(SDL_Rect){fx,         fy+gap,   fw,      TF_H};
+    tfs[FP].rect=(SDL_Rect){fx,         fy+gap*2, fw/4-4,  TF_H};
+    tfs[FS].rect=(SDL_Rect){fx+fw/4+4,  fy+gap*2, fw/4-4,  TF_H};
+    tfs[FB_F].rect=(SDL_Rect){fx+fw/2+4,fy+gap*2, fw/4-4,  TF_H};
+    tfs[FB_BRAND].rect=(SDL_Rect){fx+fw*3/4+6,fy+gap*2, fw/4-6, TF_H};
+
+    strcpy(tfs[FN].label,"Name");
+    strcpy(tfs[FN].hint,"e.g. Rose Oud");
+    strcpy(tfs[FD].label,"Description");
+    strcpy(tfs[FD].hint,"Short tagline");
+    strcpy(tfs[FP].label,"Price");
+    strcpy(tfs[FP].hint,"130000");
+    strcpy(tfs[FS].label,"Size");
+    strcpy(tfs[FS].hint,"100ml");
+    strcpy(tfs[FB_F].label,"Badge");
+    strcpy(tfs[FB_F].hint,"Nuevo");
+    strcpy(tfs[FB_BRAND].label,"Brand");
+    strcpy(tfs[FB_BRAND].hint,"Lattafa");
+
+    int img_y=fy+gap*3+8;
+    btn_browse=(SDL_Rect){fx,       img_y,160,34};
+    btn_paste =(SDL_Rect){fx+168,   img_y,160,34};
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Text field
+   ═══════════════════════════════════════════════════════════════ */
+static void tf_draw(TF *t,int active){
+    fr(t->rect,CARD); dr(t->rect,active?GOLD:BDR);
+    SDL_Rect clip={t->rect.x+8,t->rect.y,t->rect.w-16,t->rect.h};
+    if(t->len) dtclip(t->buf,clip,fMD,TEXT); else dtclip(t->hint,clip,fMD,MUTED);
+    if(active&&(SDL_GetTicks()/530)%2==0){
+        int cx=t->rect.x+8;
+        if(t->cur>0){ char tmp[256]; int n=t->cur<t->len?t->cur:t->len;
+            memcpy(tmp,t->buf,n); tmp[n]=0;
+            int tw,th; TTF_SizeUTF8(fMD,tmp,&tw,&th); cx+=tw; }
+        sc(GOLD); SDL_RenderDrawLine(gren,cx,t->rect.y+5,cx,t->rect.y+t->rect.h-5);
+    }
+}
+static void tf_on(int idx){
+    if(atf>=0&&atf<NF) tfs[atf].active=0;
+    if(idx>=0&&idx<NF){ tfs[idx].active=1; tfs[idx].cur=tfs[idx].len; }
+    atf=idx; SDL_StartTextInput();
+}
+static void tf_off(void){
+    if(atf>=0&&atf<NF) tfs[atf].active=0;
+    atf=-1; SDL_StopTextInput();
+}
+static void tf_ins(TF *t,const char *s){
+    int sl=strlen(s); if(t->len+sl>=(int)sizeof(t->buf)) return;
+    memmove(t->buf+t->cur+sl,t->buf+t->cur,t->len-t->cur+1);
+    memcpy(t->buf+t->cur,s,sl); t->len+=sl; t->cur+=sl;
+}
+static void tf_bs(TF *t){
+    if(!t->cur) return;
+    memmove(t->buf+t->cur-1,t->buf+t->cur,t->len-t->cur+1);
+    t->len--; t->cur--;
+}
+static void tf_clr(TF *t){ t->buf[0]=0; t->len=t->cur=0; }
+
+/* ═══════════════════════════════════════════════════════════════
+   Render
+   ═══════════════════════════════════════════════════════════════ */
+static void render(void){
+    sc(BG); SDL_RenderClear(gren);
+
+    int bary=WIN_H-BAR_H-STAT_H;
+    int rx=LIST_W+1;
 
     /* ── LEFT PANEL ── */
-    frect((SDL_Rect){0, 0, LIST_W, bary}, C_PANEL);
-    frect((SDL_Rect){0, 0, LIST_W, 40},  C_CARD);
-    dtext("Products", PAD, 12, gflg, C_GOLD);
-    hline(0, LIST_W, 40, C_BDR);
+    fr((SDL_Rect){0,0,LIST_W,bary},PANEL);
+    fr((SDL_Rect){0,0,LIST_W,42},CARD);
+    dt("Products",PAD,12,fLG,GOLD);
+    hl(0,LIST_W,42,BDR);
 
-    int item_h = 46;
-    for (int i = 0; i < np; i++) {
-        SDL_Rect ir = {0, 40 + i * item_h, LIST_W, item_h};
-        SDL_Color bg = (i == sel) ? C_SEL : (i == hov_item) ? C_HOV : C_PANEL;
-        frect(ir, bg);
-        hline(0, LIST_W, ir.y + item_h - 1, C_BDR);
-        if (i == sel) frect((SDL_Rect){0, ir.y, 3, item_h}, C_GOLD);
+    /* product list — scrollable */
+    int vis_items=(bary-42)/ITEM_H;
+    int max_scroll=np-vis_items; if(max_scroll<0) max_scroll=0;
+    if(list_scroll>max_scroll) list_scroll=max_scroll;
 
-        SDL_Rect clip = {PAD + 4, ir.y + 8, LIST_W - PAD*2, 18};
-        SDL_Color nc  = (i == sel) ? C_LGOLD : C_TEXT;
-        dtext_clip(prods[i].name[0] ? prods[i].name : "(unnamed)", clip, gfnt, nc);
+    SDL_RenderSetClipRect(gren,&(SDL_Rect){0,42,LIST_W,bary-42});
+    for(int i=0;i<np;i++){
+        int iy=42+(i-list_scroll)*ITEM_H;
+        if(iy+ITEM_H<42||iy>bary) continue;
+        SDL_Rect ir={0,iy,LIST_W,ITEM_H};
+        SDL_Color bg=(i==sel)?SELB:(i==hov_item)?HOVB:PANEL;
+        fr(ir,bg); hl(0,LIST_W,iy+ITEM_H-1,BDR);
+        if(i==sel) fr((SDL_Rect){0,iy,3,ITEM_H},GOLD);
+        SDL_Rect nc={PAD+4,iy+8,LIST_W-PAD*2,18};
+        dtclip(prods[i].name[0]?prods[i].name:"(unnamed)",nc,fMD,(i==sel)?LGOLD:TEXT);
+        char pt[32]; snprintf(pt,sizeof(pt),"$%s / %s",prods[i].price,prods[i].size);
+        SDL_Rect pc={PAD+4,iy+28,LIST_W-PAD*2,14}; dtclip(pt,pc,fSM,MUTED);
+    }
+    SDL_RenderSetClipRect(gren,NULL);
 
-        char ptxt[24];
-        snprintf(ptxt, sizeof(ptxt), "$%s / %s", prods[i].price, prods[i].size);
-        SDL_Rect pc = {PAD + 4, ir.y + 28, LIST_W - PAD*2, 14};
-        dtext_clip(ptxt, pc, gfsm, C_MUTE);
+    /* scrollbar for product list */
+    if(np>vis_items){
+        int sbh=bary-42, sby=42;
+        int th=sbh*vis_items/np;
+        int ty=sby+(list_scroll*(sbh-th))/(np-vis_items);
+        fr((SDL_Rect){LIST_W-5,sby,4,sbh},CARD);
+        fr((SDL_Rect){LIST_W-5,ty,4,th},MUTED);
     }
 
-    frect((SDL_Rect){0, bary, LIST_W, BTN_BAR}, C_PANEL);
-    hline(0, LIST_W, bary, C_BDR);
-    draw_button(btn_add, "+ Add",  (SDL_Color){20,40,15,255}, C_GRN);
-    draw_button(btn_del, "Delete", (SDL_Color){40,15,15,255}, C_RED);
+    /* left bar */
+    fr((SDL_Rect){0,bary,LIST_W,BAR_H},PANEL);
+    hl(0,LIST_W,bary,BDR);
+    btn(btn_add,"+ Add",   C(18,38,14),GRN);
+    btn(btn_del,"Delete",  C(38,14,14),RED);
 
     /* ── DIVIDER ── */
-    frect((SDL_Rect){LIST_W, 0, 1, WIN_H}, C_BDR);
+    fr((SDL_Rect){LIST_W,0,1,WIN_H},BDR);
 
-    /* ── RIGHT PANEL ── */
-    frect((SDL_Rect){right, 0, WIN_W-right, 40}, C_CARD);
-    hline(right, WIN_W, 40, C_BDR);
+    /* ── RIGHT PANEL HEADER ── */
+    fr((SDL_Rect){rx,0,WIN_W-rx,42},CARD);
+    hl(rx,WIN_W,42,BDR);
 
-    /* WS status dot + order counter in header */
-    SDL_Color dot_col = ws_state == WS_CONNECTED    ? (SDL_Color){37,175,85,255} :
-                        ws_state == WS_CONNECTING   ? (SDL_Color){200,160,30,255}
-                                                    : (SDL_Color){165,50,50,255};
-    frect((SDL_Rect){WIN_W-180, 14, 10, 10}, dot_col);
-    frect((SDL_Rect){WIN_W-179, 13, 8,  8},  dot_col);
-
-    char order_txt[48];
-    snprintf(order_txt, sizeof(order_txt), "Orders today: %d", ws_orders);
-    dtext(order_txt, WIN_W-165, 12, gfsm, C_MUTE);
-
-    const char *ws_label = ws_state == WS_CONNECTED  ? "Live" :
-                           ws_state == WS_CONNECTING ? "Connecting..." : "Offline";
-    SDL_Color wslc = ws_state == WS_CONNECTED ? C_GRN : C_MUTE;
-    dtext(ws_label, WIN_W-165, 24, gfsm, wslc);
-
-    if (np == 0) {
-        SDL_Rect c = {right, 40, WIN_W-right, bary-40};
-        dtext_center("No products — click + Add", c, gfnt, C_MUTE);
+    if(np==0){
+        char htitle[64]="Editing: —";
+        dt(htitle,rx+PAD,12,fLG,MUTED);
     } else {
-        char htitle[80];
-        snprintf(htitle, sizeof(htitle), "Editing: %s",
-                 prods[sel].name[0] ? prods[sel].name : "(new)");
-        dtext(htitle, right + PAD, 12, gflg, C_TEXT);
+        char htitle[80]; snprintf(htitle,sizeof(htitle),"Editing: %s",
+            prods[sel].name[0]?prods[sel].name:"(new)");
+        dt(htitle,rx+PAD,12,fLG,TEXT);
+    }
 
-        for (int i = 0; i < NFIELDS; i++) {
-            TF *t = &tfs[i];
-            dtext(t->label, t->rect.x, t->rect.y - 18, gfsm, C_MUTE);
-            draw_tf(t, atf == i);
+    /* WS status (top-right) */
+    SDL_Color dc = ws_state==WS_READY?GRN : ws_state==WS_CONN?C(200,160,30):RED;
+    fr((SDL_Rect){WIN_W-136,16,10,10},dc);
+    const char *wsl = ws_state==WS_READY?"Live" : ws_state==WS_CONN?"Connecting...":"Offline";
+    dt(wsl,WIN_W-122,12,fSM,dc);
+    char oc[32]; snprintf(oc,sizeof(oc),"Orders: %d",ws_orders);
+    dt(oc,WIN_W-122,24,fSM,MUTED);
+
+    /* ── EDIT FORM ── */
+    if(np>0){
+        for(int i=0;i<NF;i++){
+            dt(tfs[i].label,tfs[i].rect.x,tfs[i].rect.y-16,fSM,MUTED);
+            tf_draw(&tfs[i],atf==i);
         }
 
         /* image section */
-        dtext("Product Image", btn_browse.x, btn_browse.y - 18, gfsm, C_MUTE);
+        dt("Product Image",btn_browse.x,btn_browse.y-16,fSM,MUTED);
+        btn(btn_browse,"Browse Files", BLUE,TEXT);
+        btn(btn_paste, "Paste Clipboard",C(20,55,35),GRN);
+        dt("JPG PNG WEBP GIF BMP",btn_paste.x+btn_paste.w+12,btn_paste.y+11,fSM,MUTED);
 
-        draw_button(btn_browse, "Browse Files",     C_PURP, C_TEXT);
-        draw_button(btn_paste,  "Paste Clipboard",
-                    (SDL_Color){40,80,60,255}, C_GRN);
-
-        /* accepted formats hint */
-        dtext("JPG  PNG  WEBP  GIF  BMP",
-              btn_paste.x + btn_paste.w + 14,
-              btn_paste.y + 10, gfsm, C_MUTE);
-
-        if (imgtex) {
-            int pw = 160, ph = 160;
-            float ar = (float)imgw / (imgh > 0 ? imgh : 1);
-            if (ar > 1.0f) ph = (int)(pw / ar);
-            else           pw = (int)(ph * ar);
-
-            SDL_Rect pr = { btn_browse.x, btn_browse.y + 44, pw, ph };
-            SDL_RenderCopy(gren, imgtex, NULL, &pr);
-            drect(pr, C_BDR);
-
-            SDL_Rect pclip = { btn_browse.x + pw + 12, pr.y, WIN_W-btn_browse.x-pw-24, 14 };
-            dtext_clip(prods[sel].image, pclip, gfsm, C_MUTE);
-        } else if (prods[sel].image[0]) {
-            dtext(prods[sel].image, btn_browse.x, btn_browse.y + 46, gfsm, C_MUTE);
+        if(imgtex){
+            int pw=150,ph=150;
+            float ar=(float)imgw/(imgh>0?imgh:1);
+            if(ar>1) ph=(int)(pw/ar); else pw=(int)(ph*ar);
+            SDL_Rect pr={btn_browse.x,btn_browse.y+44,pw,ph};
+            SDL_RenderCopy(gren,imgtex,NULL,&pr); dr(pr,BDR);
+            SDL_Rect pc={btn_browse.x+pw+10,pr.y,WIN_W-btn_browse.x-pw-20,14};
+            dtclip(prods[sel].image,pc,fSM,MUTED);
         } else {
-            dtext("No image set — emoji icon used",
-                  btn_browse.x, btn_browse.y + 46, gfsm, C_MUTE);
+            const char *imsg=prods[sel].image[0]?prods[sel].image:"No image — emoji used";
+            dt(imsg,btn_browse.x,btn_browse.y+46,fSM,MUTED);
         }
+    } else {
+        SDL_Rect ctr={rx,42,WIN_W-rx,bary-42};
+        dtctr("Click + Add to create your first product",ctr,fMD,MUTED);
     }
 
     /* ── BOTTOM BAR ── */
-    frect((SDL_Rect){right, bary, WIN_W-right, BTN_BAR}, C_CARD);
-    hline(right, WIN_W, bary, C_BDR);
-    /* WS sync button */
-    SDL_Color ws_btn_col = ws_state == WS_CONNECTED
-        ? (SDL_Color){20,50,70,255} : (SDL_Color){30,30,30,255};
-    draw_button(btn_wssync, "Sync via WebSocket", ws_btn_col,
-                ws_state == WS_CONNECTED ? C_TEXT : C_MUTE);
+    fr((SDL_Rect){rx,bary,WIN_W-rx,BAR_H},CARD);
+    hl(rx,WIN_W,bary,BDR);
 
-    draw_button(btn_save, "Save HTML",       C_GRN,                   (SDL_Color){10,10,10,255});
-    draw_button(btn_push, "Push to GitHub",  (SDL_Color){25,45,25,255}, C_GRN);
-    if (dirty) dtext("*", btn_save.x - 14, btn_save.y + 9, gfnt, C_GOLD);
+    SDL_Color wbc=ws_state==WS_READY?C(18,45,65):C(28,28,28);
+    SDL_Color wfc=ws_state==WS_READY?TEXT:MUTED;
+    btn(btn_wssync,"Sync Live",wbc,wfc);
+    btn(btn_save,  "Save HTML",GRN,C(8,8,8));
+    btn(btn_push,  "Push GitHub",C(20,40,20),GRN);
+    if(dirty) dt("*",btn_save.x-14,btn_save.y+10,fMD,GOLD);
 
     /* ── STATUS BAR ── */
-    int sy = WIN_H - STAT_H;
-    frect((SDL_Rect){0, sy, WIN_W, STAT_H}, C_DARK2);
-    hline(0, WIN_W, sy, C_BDR);
-    dtext(stmsg, PAD, sy + 6, gfsm, C_MUTE);
+    int sy=WIN_H-STAT_H;
+    fr((SDL_Rect){0,sy,WIN_W,STAT_H},C(10,10,10));
+    hl(0,WIN_W,sy,BDR);
+    dt(stmsg,PAD,sy+7,fSM,MUTED);
 
-    /* ── ORDER NOTIFICATION POPUP ── */
-    pthread_mutex_lock(&ws_mutex);
-    if (ws_notif.visible) {
-        Uint32 age = SDL_GetTicks() - ws_notif.shown_at;
-        if (age > 10000) {
-            ws_notif.visible = 0;
-        } else {
-            /* fade out last 2 seconds */
-            Uint8 alpha = age > 8000 ? (Uint8)(255 - (age-8000)*255/2000) : 255;
-            int nw = 300, nh = 130;
-            SDL_Rect nr = {WIN_W - nw - 12, WIN_H - STAT_H - nh - 12, nw, nh};
+    /* ── ORDER NOTIFICATION ── */
+    pthread_mutex_lock(&notif_mtx);
+    if(notif.on){
+        Uint32 age=SDL_GetTicks()-notif.at;
+        if(age>10000){ notif.on=0; }
+        else {
+            Uint8 alpha=age>8000?(Uint8)(255-(age-8000)*255/2000):255;
+            int nw=290,nh=128;
+            SDL_Rect nr={WIN_W-nw-10,WIN_H-STAT_H-nh-10,nw,nh};
 
-            SDL_SetRenderDrawBlendMode(gren, SDL_BLENDMODE_BLEND);
-            SDL_SetRenderDrawColor(gren, 22, 22, 22, alpha);
-            SDL_RenderFillRect(gren, &nr);
-            SDL_SetRenderDrawColor(gren, 37, 175, 85, alpha);
-            SDL_RenderDrawRect(gren, &nr);
-            SDL_SetRenderDrawBlendMode(gren, SDL_BLENDMODE_NONE);
+            SDL_SetRenderDrawBlendMode(gren,SDL_BLENDMODE_BLEND);
+            SDL_SetRenderDrawColor(gren,20,20,20,alpha); SDL_RenderFillRect(gren,&nr);
+            SDL_SetRenderDrawColor(gren,37,175,85,alpha); SDL_RenderDrawRect(gren,&nr);
+            SDL_SetRenderDrawBlendMode(gren,SDL_BLENDMODE_NONE);
 
-            SDL_Color nc = {240,234,214,alpha};
-            SDL_Color gc = {37,175,85,alpha};
-            SDL_Color mc = {110,110,110,alpha};
-
-            dtext("New Order!", nr.x+12, nr.y+10, gflg, gc);
-            dtext(ws_notif.name[0] ? ws_notif.name : "Customer",
-                  nr.x+12, nr.y+36, gfnt, nc);
-            if (ws_notif.city[0]) dtext(ws_notif.city, nr.x+12, nr.y+54, gfsm, mc);
-            dtext(ws_notif.items_text, nr.x+12, nr.y+72, gfsm, mc);
-
-            char cnt_txt[40];
-            snprintf(cnt_txt, sizeof(cnt_txt), "Order #%d today", ws_orders);
-            dtext(cnt_txt, nr.x+12, nr.y+92, gfsm, gc);
-
-            /* dismiss button */
-            SDL_Rect db = {nr.x+nr.w-70, nr.y+nh-30, 60, 22};
-            frect(db, (SDL_Color){50,50,50,alpha});
-            dtext_center("dismiss", db, gfsm, mc);
+            SDL_Color nc={240,234,214,alpha},gc={37,175,85,alpha},mc={105,105,105,alpha};
+            dt("New Order!",nr.x+10,nr.y+8,fLG,gc);
+            dt(notif.name[0]?notif.name:"Customer",nr.x+10,nr.y+34,fMD,nc);
+            if(notif.city[0]) dt(notif.city,nr.x+10,nr.y+52,fSM,mc);
+            char tot[48]; snprintf(tot,sizeof(tot),"Total: $%s",notif.total);
+            dt(tot,nr.x+10,nr.y+68,fSM,mc);
+            char ord[40]; snprintf(ord,sizeof(ord),"Order #%d today",notif.order_no);
+            dt(ord,nr.x+10,nr.y+88,fSM,gc);
+            SDL_Rect db={nr.x+nw-64,nr.y+nh-26,56,20};
+            fr(db,C(45,45,45)); dtctr("dismiss",db,fSM,mc);
         }
     }
-    pthread_mutex_unlock(&ws_mutex);
+    pthread_mutex_unlock(&notif_mtx);
 
-    /* ── FILE BROWSER (overlay) ── */
-    if (fb.open) fb_draw();
+    /* ── BRANDS BUTTON (above left bar) ── */
+    SDL_Color bbc = bp.open ? GOLD : CARD;
+    SDL_Color bfc = bp.open ? BG   : MUTED;
+    fr(btn_brands,bbc); dr(btn_brands,bp.open?GOLD:BDR);
+    dtctr("Manage Brands",btn_brands,fSM,bfc);
+
+    /* ── FILE BROWSER ── */
+    if(fb.open) fb_draw();
+
+    /* ── BRANDS PANEL ── */
+    if(bp.open){
+        int bpw=360, bph=440;
+        bp.rect=(SDL_Rect){(WIN_W-bpw)/2,(WIN_H-bph)/2,bpw,bph};
+        SDL_Rect r=bp.rect;
+
+        SDL_SetRenderDrawBlendMode(gren,SDL_BLENDMODE_BLEND);
+        SDL_SetRenderDrawColor(gren,0,0,0,160); SDL_RenderFillRect(gren,NULL);
+        SDL_SetRenderDrawBlendMode(gren,SDL_BLENDMODE_NONE);
+
+        fr(r,PANEL); dr(r,GOLD);
+        fr((SDL_Rect){r.x,r.y,r.w,40},CARD); hl(r.x,r.x+r.w,r.y+40,BDR);
+        dt("Marcas / Brands",r.x+PAD,r.y+10,fLG,GOLD);
+        SDL_Rect xb={r.x+r.w-34,r.y+4,28,28};
+        fr(xb,RED); dtctr("X",xb,fMD,TEXT);
+
+        /* brand list */
+        SDL_Rect listR={r.x,r.y+40,r.w,r.h-100};
+        SDL_RenderSetClipRect(gren,&listR);
+        for(int i=0;i<nb;i++){
+            int iy=listR.y+i*32;
+            if(iy+32<listR.y||iy>listR.y+listR.h) continue;
+            SDL_Rect row={listR.x,iy,listR.w,32};
+            fr(row,i==bp.hov?HOVB:PANEL);
+            hl(listR.x,listR.x+listR.w,iy+31,BDR);
+            SDL_Rect bnc={listR.x+PAD,iy,listR.w-48,32}; dtclip(brands[i],bnc,fMD,TEXT);
+            SDL_Rect del={r.x+r.w-38,iy+6,22,20};
+            fr(del,C(50,18,18)); dtctr("x",del,fSM,RED);
+        }
+        SDL_RenderSetClipRect(gren,NULL);
+
+        /* add brand input */
+        int iny=r.y+r.h-56;
+        hl(r.x,r.x+r.w,iny-4,BDR);
+        SDL_Rect inr={r.x+PAD,iny,r.w-PAD*2-80,32};
+        fr(inr,CARD); dr(inr,BDR);
+        SDL_Rect clip2={inr.x+6,inr.y,inr.w-12,inr.h};
+        if(bp.addlen) dtclip(bp.addbuf,clip2,fMD,TEXT);
+        else dtclip("New brand name...",clip2,fMD,MUTED);
+        SDL_Rect addb={r.x+r.w-74,iny,62,32};
+        fr(addb,GRN); dtctr("Add",addb,fMD,BG);
+    }
 
     SDL_RenderPresent(gren);
 }
 
-/* ═══════════════════════════════════════════════════════════════════
-   Event handling
-   ═══════════════════════════════════════════════════════════════════ */
-static int pt_in(SDL_Rect r, int x, int y) {
-    return x >= r.x && x < r.x+r.w && y >= r.y && y < r.y+r.h;
+/* ═══════════════════════════════════════════════════════════════
+   File browser confirm
+   ═══════════════════════════════════════════════════════════════ */
+static void fb_confirm(void){
+    if(fb.sel2<0) return;
+    FBEntry *e=&fb.ents[fb.sel2];
+    if(e->is_dir){ fb_go(e->path); return; }
+    char rel[256];
+    if(!img_copy(e->path,rel,sizeof(rel))){ set_st("ERROR: Could not copy image"); return; }
+    strncpy(prods[sel].image,rel,255); img_load(rel);
+    dirty=1; fb.open=0; set_st("Image set! Save HTML to keep it.");
 }
 
-/* confirm file browser selection */
-static void fb_confirm_sel(void) {
-    if (fb.selected < 0) return;
-    FBEntry *e = &fb.entries[fb.selected];
-    if (e->is_dir) { fb_navigate(e->fullpath); return; }
+/* ═══════════════════════════════════════════════════════════════
+   Events
+   ═══════════════════════════════════════════════════════════════ */
+static int pin(SDL_Rect r,int x,int y){
+    return x>=r.x&&x<r.x+r.w&&y>=r.y&&y<r.y+r.h;
+}
 
-    char dest_rel[256];
-    if (!copy_image(e->fullpath, dest_rel, sizeof(dest_rel))) {
-        set_status("ERROR: Could not copy image");
+static void handle(SDL_Event *e){
+    if(e->type==SDL_QUIT){ ws_running=0; SDL_Quit(); exit(0); }
+
+    /* ── brands panel ── */
+    if(bp.open){
+        if(e->type==SDL_MOUSEMOTION){
+            int mx=e->motion.x,my=e->motion.y; bp.hov=-1;
+            SDL_Rect r=bp.rect;
+            SDL_Rect listR={r.x,r.y+40,r.w,r.h-100};
+            if(pin(listR,mx,my)){ int idx=(my-listR.y)/32; if(idx>=0&&idx<nb) bp.hov=idx; }
+            return;
+        }
+        if(e->type==SDL_MOUSEBUTTONDOWN&&e->button.button==SDL_BUTTON_LEFT){
+            int mx=e->button.x,my=e->button.y;
+            SDL_Rect r=bp.rect;
+            SDL_Rect xb={r.x+r.w-34,r.y+4,28,28};
+            if(pin(xb,mx,my)){ bp.open=0; return; }
+            /* delete brand */
+            SDL_Rect listR={r.x,r.y+40,r.w,r.h-100};
+            if(pin(listR,mx,my)){
+                int idx=(my-listR.y)/32;
+                if(idx>=0&&idx<nb){
+                    SDL_Rect del={r.x+r.w-38,r.y+40+idx*32+6,22,20};
+                    if(pin(del,mx,my)){
+                        memmove(&brands[idx],&brands[idx+1],(nb-idx-1)*sizeof(brands[0]));
+                        nb--; dirty=1; return;
+                    }
+                    /* click on brand → set for current product */
+                    if(sel>=0&&sel<np){
+                        strncpy(prods[sel].brand,brands[idx],47);
+                        tf_set(&tfs[FB_BRAND],prods[sel].brand);
+                        dirty=1;
+                    }
+                }
+                return;
+            }
+            /* add brand button */
+            int iny=r.y+r.h-56;
+            SDL_Rect addb={r.x+r.w-74,iny,62,32};
+            if(pin(addb,mx,my)&&bp.addlen>0&&nb<MAX_BRANDS){
+                strncpy(brands[nb],bp.addbuf,47); nb++;
+                bp.addbuf[0]=0; bp.addlen=0; dirty=1; return;
+            }
+            return;
+        }
+        if(e->type==SDL_KEYDOWN){
+            if(e->key.keysym.sym==SDLK_ESCAPE){ bp.open=0; return; }
+            if(e->key.keysym.sym==SDLK_BACKSPACE&&bp.addlen>0){ bp.addbuf[--bp.addlen]=0; return; }
+            if(e->key.keysym.sym==SDLK_RETURN&&bp.addlen>0&&nb<MAX_BRANDS){
+                strncpy(brands[nb],bp.addbuf,47); nb++;
+                bp.addbuf[0]=0; bp.addlen=0; dirty=1; return;
+            }
+            return;
+        }
+        if(e->type==SDL_TEXTINPUT&&bp.addlen<47){
+            int sl=strlen(e->text.text);
+            if(bp.addlen+sl<47){ memcpy(bp.addbuf+bp.addlen,e->text.text,sl); bp.addlen+=sl; bp.addbuf[bp.addlen]=0; }
+            return;
+        }
         return;
     }
-    strncpy(prods[sel].image, dest_rel, sizeof(prods[sel].image) - 1);
-    load_preview(dest_rel);
-    dirty  = 1;
-    fb.open = 0;
-    set_status("Image set! Remember to Save & Update HTML.");
-}
 
-static void handle_event(SDL_Event *e) {
-    if (e->type == SDL_QUIT) { SDL_Quit(); exit(0); }
-
-    /* ── FILE BROWSER events ── */
-    if (fb.open) {
-        if (e->type == SDL_MOUSEWHEEL) {
-            fb.scroll -= e->wheel.y * 3;
-            if (fb.scroll < 0) fb.scroll = 0;
-            int max = fb.count - fb_vis();
-            if (fb.scroll > max && max >= 0) fb.scroll = max;
+    /* ── file browser ── */
+    if(fb.open){
+        if(e->type==SDL_MOUSEWHEEL){
+            fb.scroll-=e->wheel.y*3;
+            if(fb.scroll<0) fb.scroll=0;
+            int mx=fb.cnt-fb_vis(); if(fb.scroll>mx&&mx>=0) fb.scroll=mx;
             return;
         }
-        if (e->type == SDL_MOUSEMOTION) {
-            int mx = e->motion.x, my = e->motion.y;
-            fb.hovered = -1;
-            if (pt_in(fb.list_rect, mx, my)) {
-                int idx = fb.scroll + (my - fb.list_rect.y) / FB_ITEM_H;
-                if (idx >= 0 && idx < fb.count) fb.hovered = idx;
+        if(e->type==SDL_MOUSEMOTION){
+            int mx=e->motion.x,my=e->motion.y; fb.hov=-1;
+            if(pin(fb.list,mx,my)){
+                int idx=fb.scroll+(my-fb.list.y)/FB_ROW;
+                if(idx>=0&&idx<fb.cnt) fb.hov=idx;
             }
             return;
         }
-        if (e->type == SDL_MOUSEBUTTONDOWN && e->button.button == SDL_BUTTON_LEFT) {
-            int mx = e->button.x, my = e->button.y;
+        if(e->type==SDL_MOUSEBUTTONDOWN&&e->button.button==SDL_BUTTON_LEFT){
+            int mx=e->button.x,my=e->button.y;
+            SDL_Rect r=fb.rect;
+            SDL_Rect xb={r.x+r.w-34,r.y+4,28,28};
+            SDL_Rect ub={r.x+r.w-80,r.y+47,32,22};
+            SDL_Rect hb2={r.x+r.w-44,r.y+47,34,22};
+            int bby=r.y+r.h-43,bw=150,bh=34;
+            SDL_Rect pbtn={r.x+PAD,bby,bw,bh};
+            SDL_Rect cbtn={r.x+r.w-PAD-bw*2-8,bby,bw,bh};
+            SDL_Rect obtn={r.x+r.w-PAD-bw,bby,bw,bh};
 
-            /* close button */
-            SDL_Rect close_btn = {fb.rect.x + fb.rect.w - 36, fb.rect.y + 4, 30, 30};
-            if (pt_in(close_btn, mx, my)) { fb.open = 0; return; }
-
-            /* up button */
-            SDL_Rect up_btn  = {fb.rect.x + fb.rect.w - 80, fb.rect.y + 46, 34, 24};
-            SDL_Rect hom_btn = {fb.rect.x + fb.rect.w - 42, fb.rect.y + 46, 34, 24};
-            if (pt_in(up_btn, mx, my)) {
-                char parent[512];
-                strncpy(parent, fb.path, sizeof(parent) - 1);
-                char *sl = strrchr(parent, '/');
-                if (sl && sl != parent) { *sl = '\0'; fb_navigate(parent); }
-                return;
+            if(pin(xb,mx,my)){ fb.open=0; return; }
+            if(pin(ub,mx,my)){
+                char par[512]; strncpy(par,fb.path,511);
+                char *sl=strrchr(par,'/'); if(sl&&sl!=par){ *sl=0; fb_go(par); } return;
             }
-            if (pt_in(hom_btn, mx, my)) {
-                const char *home = getenv("HOME");
-                fb_navigate(home ? home : "/home");
-                return;
-            }
-
-            /* bottom buttons */
-            int bbw = 160, bbh = 34, bby = fb.rect.y + fb.rect.h - 43;
-            SDL_Rect paste_btn  = {fb.rect.x + PAD, bby, bbw, bbh};
-            SDL_Rect open_btn   = {fb.rect.x + fb.rect.w - PAD - bbw,       bby, bbw, bbh};
-            SDL_Rect cancel_btn = {fb.rect.x + fb.rect.w - PAD - bbw*2 - 8, bby, bbw, bbh};
-
-            if (pt_in(paste_btn,  mx, my)) { try_paste_clipboard(); return; }
-            if (pt_in(cancel_btn, mx, my)) { fb.open = 0; return; }
-            if (pt_in(open_btn,   mx, my)) { fb_confirm_sel(); return; }
-
-            /* list click */
-            if (pt_in(fb.list_rect, mx, my)) {
-                int idx = fb.scroll + (my - fb.list_rect.y) / FB_ITEM_H;
-                if (idx >= 0 && idx < fb.count) {
-                    FBEntry *ent = &fb.entries[idx];
-                    if (ent->is_dir) {
-                        fb_navigate(ent->fullpath);
-                    } else {
-                        /* single click selects, double click opens */
-                        static int last_idx = -1;
-                        static Uint32 last_t = 0;
-                        Uint32 now = SDL_GetTicks();
-                        if (idx == last_idx && now - last_t < 400) {
-                            fb.selected = idx;
-                            fb_confirm_sel();
-                        } else {
-                            fb.selected = idx;
-                        }
-                        last_idx = idx;
-                        last_t   = now;
+            if(pin(hb2,mx,my)){ const char *h=getenv("HOME"); fb_go(h?h:"/home"); return; }
+            if(pin(pbtn,mx,my)){ paste_clip(); return; }
+            if(pin(cbtn,mx,my)){ fb.open=0; return; }
+            if(pin(obtn,mx,my)){ fb_confirm(); return; }
+            if(pin(fb.list,mx,my)){
+                int idx=fb.scroll+(my-fb.list.y)/FB_ROW;
+                if(idx>=0&&idx<fb.cnt){
+                    FBEntry *fe=&fb.ents[idx];
+                    if(fe->is_dir){ fb_go(fe->path); }
+                    else {
+                        static int li=-1; static Uint32 lt=0;
+                        Uint32 now=SDL_GetTicks();
+                        if(idx==li&&now-lt<400){ fb.sel2=idx; fb_confirm(); }
+                        else fb.sel2=idx;
+                        li=idx; lt=now;
                     }
                 }
             }
             return;
         }
-        if (e->type == SDL_KEYDOWN && e->key.keysym.sym == SDLK_ESCAPE) {
-            fb.open = 0; return;
-        }
-        if (e->type == SDL_KEYDOWN && e->key.keysym.sym == SDLK_RETURN) {
-            fb_confirm_sel(); return;
-        }
-        return;  /* consume all other events while browser is open */
-    }
-
-    /* ── MOUSE MOTION ── */
-    if (e->type == SDL_MOUSEMOTION) {
-        int mx = e->motion.x, my = e->motion.y;
-        hov_item = -1;
-        int item_h = 46;
-        for (int i = 0; i < np; i++) {
-            SDL_Rect ir = {0, 40 + i * item_h, LIST_W, item_h};
-            if (pt_in(ir, mx, my)) { hov_item = i; break; }
+        if(e->type==SDL_KEYDOWN){
+            if(e->key.keysym.sym==SDLK_ESCAPE) fb.open=0;
+            if(e->key.keysym.sym==SDLK_RETURN) fb_confirm();
+            return;
         }
         return;
     }
 
-    /* ── MOUSE CLICK ── */
-    if (e->type == SDL_MOUSEBUTTONDOWN && e->button.button == SDL_BUTTON_LEFT) {
-        int mx = e->button.x, my = e->button.y;
+    /* ── mouse wheel: scroll product list ── */
+    if(e->type==SDL_MOUSEWHEEL&&e->wheel.x==0){
+        if(e->motion.x<LIST_W||!e->motion.x){
+            list_scroll-=e->wheel.y;
+            if(list_scroll<0) list_scroll=0;
+        }
+        return;
+    }
+
+    /* ── mouse motion ── */
+    if(e->type==SDL_MOUSEMOTION){
+        int mx=e->motion.x,my=e->motion.y; hov_item=-1;
+        for(int i=0;i<np;i++){
+            SDL_Rect ir={0,42+(i-list_scroll)*ITEM_H,LIST_W,ITEM_H};
+            if(pin(ir,mx,my)){ hov_item=i; break; }
+        }
+        return;
+    }
+
+    /* ── mouse click ── */
+    if(e->type==SDL_MOUSEBUTTONDOWN&&e->button.button==SDL_BUTTON_LEFT){
+        int mx=e->button.x,my=e->button.y;
+
+        /* dismiss notification */
+        pthread_mutex_lock(&notif_mtx);
+        if(notif.on){
+            int nw=290,nh=128;
+            SDL_Rect db={WIN_W-nw-10+nw-64, WIN_H-STAT_H-nh-10+nh-26, 56,20};
+            if(pin(db,mx,my)){ notif.on=0; pthread_mutex_unlock(&notif_mtx); return; }
+        }
+        pthread_mutex_unlock(&notif_mtx);
 
         /* product list */
-        int item_h = 46;
-        for (int i = 0; i < np; i++) {
-            SDL_Rect ir = {0, 40 + i * item_h, LIST_W, item_h};
-            if (pt_in(ir, mx, my)) {
-                fields_to_prod(sel);
-                sel = i;
-                fields_from_prod(sel);
-                tf_deactivate();
-                return;
+        for(int i=0;i<np;i++){
+            SDL_Rect ir={0,42+(i-list_scroll)*ITEM_H,LIST_W,ITEM_H};
+            if(pin(ir,mx,my)){
+                f2p(sel); sel=i; p2f(sel); tf_off(); return;
             }
         }
 
         /* add */
-        if (pt_in(btn_add, mx, my) && np < MAX_PRODS) {
-            fields_to_prod(sel);
-            Prod *p = &prods[np];
-            memset(p, 0, sizeof(Prod));
-            p->id = nxtid++;
-            strcpy(p->name, "New Perfume");
-            strcpy(p->price, "0");
-            strcpy(p->size, "50ml");
-            strcpy(p->icon, "🌺");
-            sel = np++;
-            fields_from_prod(sel);
-            dirty = 1;
-            return;
+        if(pin(btn_add,mx,my)&&np<MAX_PRODS){
+            f2p(sel);
+            Prod *p=&prods[np]; memset(p,0,sizeof(Prod));
+            p->id=nxtid++; strcpy(p->name,"New Perfume");
+            strcpy(p->price,"0"); strcpy(p->size,"100ml"); strcpy(p->icon,"🌹");
+            sel=np++; p2f(sel); dirty=1; return;
         }
-
         /* delete */
-        if (pt_in(btn_del, mx, my) && np > 0) {
-            fields_to_prod(sel);
-            memmove(&prods[sel], &prods[sel+1], (np - sel - 1) * sizeof(Prod));
-            np--;
-            if (sel >= np && sel > 0) sel--;
-            fields_from_prod(sel);
-            free_img();
-            dirty = 1;
-            return;
+        if(pin(btn_del,mx,my)&&np>0){
+            f2p(sel);
+            memmove(&prods[sel],&prods[sel+1],(np-sel-1)*sizeof(Prod));
+            np--; if(sel>=np&&sel>0) sel--;
+            if(np>0) p2f(sel); else img_free(); dirty=1; return;
         }
-
         /* text fields */
-        for (int i = 0; i < NFIELDS; i++) {
-            if (pt_in(tfs[i].rect, mx, my)) {
-                fields_to_prod(sel);
-                tf_activate(i);
-                return;
-            }
+        for(int i=0;i<NF;i++){
+            if(pin(tfs[i].rect,mx,my)){ f2p(sel); tf_on(i); return; }
         }
-
         /* browse */
-        if (pt_in(btn_browse, mx, my)) {
-            fields_to_prod(sel);
-            tf_deactivate();
-            fb_open();
-            return;
-        }
-
-        /* paste clipboard */
-        if (pt_in(btn_paste, mx, my)) {
-            fields_to_prod(sel);
-            tf_deactivate();
-            try_paste_clipboard();
-            return;
-        }
-
-        /* ws sync */
-        if (pt_in(btn_wssync, mx, my)) {
-            fields_to_prod(sel);
-            ws_sync_products();
-            return;
-        }
-
-        /* dismiss notification */
-        if (ws_notif.visible) {
-            int nw = 300, nh = 130;
-            SDL_Rect db = {WIN_W-nw-12 + nw-70, WIN_H-STAT_H-nh-12 + nh-30, 60, 22};
-            if (pt_in(db, mx, my)) {
-                pthread_mutex_lock(&ws_mutex);
-                ws_notif.visible = 0;
-                pthread_mutex_unlock(&ws_mutex);
-                return;
-            }
-        }
-
+        if(pin(btn_browse,mx,my)){ f2p(sel); tf_off(); fb_open_browser(); return; }
+        /* paste */
+        if(pin(btn_paste,mx,my)){ f2p(sel); tf_off(); paste_clip(); return; }
+        /* WS sync */
+        if(pin(btn_brands,mx,my)){ bp.open=!bp.open; SDL_StartTextInput(); return; }
+        if(pin(btn_wssync,mx,my)){ f2p(sel); ws_send_products(); return; }
         /* save */
-        if (pt_in(btn_save, mx, my)) { fields_to_prod(sel); save_html(); return; }
-
+        if(pin(btn_save,mx,my)){ f2p(sel); html_save(); return; }
         /* push */
-        if (pt_in(btn_push, mx, my)) {
-            fields_to_prod(sel);
-            save_html();
-            git_push();
-            return;
-        }
+        if(pin(btn_push,mx,my)){ f2p(sel); html_save(); git_push(); return; }
 
-        tf_deactivate();
+        tf_off(); return;
+    }
+
+    /* ── key ── */
+    if(e->type==SDL_KEYDOWN){
+        if(atf<0) return;
+        SDL_Keycode k=e->key.keysym.sym;
+        TF *t=&tfs[atf];
+        if(k==SDLK_BACKSPACE){ tf_bs(t); f2p(sel); }
+        else if(k==SDLK_LEFT&&t->cur>0)    t->cur--;
+        else if(k==SDLK_RIGHT&&t->cur<t->len) t->cur++;
+        else if(k==SDLK_HOME) t->cur=0;
+        else if(k==SDLK_END)  t->cur=t->len;
+        else if(k==SDLK_a&&(e->key.keysym.mod&KMOD_CTRL)){ tf_clr(t); f2p(sel); }
+        else if(k==SDLK_s&&(e->key.keysym.mod&KMOD_CTRL)){ f2p(sel); html_save(); }
+        else if(k==SDLK_TAB){ f2p(sel); tf_on((atf+1)%NF); }
+        else if(k==SDLK_RETURN||k==SDLK_ESCAPE) tf_off();
         return;
     }
 
-    /* ── KEY DOWN ── */
-    if (e->type == SDL_KEYDOWN) {
-        if (atf < 0) return;
-        SDL_Keycode k = e->key.keysym.sym;
-        TF *t = &tfs[atf];
-
-        if (k == SDLK_BACKSPACE) { tf_backspace(t); fields_to_prod(sel); }
-        else if (k == SDLK_LEFT  && t->cursor > 0)      t->cursor--;
-        else if (k == SDLK_RIGHT && t->cursor < t->len) t->cursor++;
-        else if (k == SDLK_HOME) t->cursor = 0;
-        else if (k == SDLK_END)  t->cursor = t->len;
-        else if (k == SDLK_a && (e->key.keysym.mod & KMOD_CTRL)) {
-            tf_clear(t); dirty = 1;
-        }
-        else if (k == SDLK_TAB) {
-            fields_to_prod(sel);
-            tf_activate((atf + 1) % NFIELDS);
-        }
-        else if (k == SDLK_RETURN || k == SDLK_ESCAPE) tf_deactivate();
-        else if (k == SDLK_s && (e->key.keysym.mod & KMOD_CTRL)) {
-            fields_to_prod(sel); save_html();
-        }
-        return;
-    }
-
-    /* ── TEXT INPUT ── */
-    if (e->type == SDL_TEXTINPUT) {
-        if (atf >= 0) { tf_insert(&tfs[atf], e->text.text); fields_to_prod(sel); }
-        return;
+    /* ── text input ── */
+    if(e->type==SDL_TEXTINPUT&&atf>=0){
+        tf_ins(&tfs[atf],e->text.text); f2p(sel); return;
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════
+/* ═══════════════════════════════════════════════════════════════
+   Process WS events on main thread
+   ═══════════════════════════════════════════════════════════════ */
+static void ws_poll(void){
+    WEvent ev;
+    while(wev_pop(&ev)){
+        switch(ev.kind){
+            case WEV_CONNECTED:    set_st("WebSocket connected — authenticating..."); break;
+            case WEV_DISCONNECTED: set_st("WebSocket offline — reconnecting in 5s..."); break;
+            case WEV_SYNCED:       set_st("Live! Products synced to website."); break;
+            case WEV_ORDER:        set_st("New order received!"); break;
+        }
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════
    main
-   ═══════════════════════════════════════════════════════════════════ */
-int main(void) {
-    SDL_Init(SDL_INIT_VIDEO);
+   ═══════════════════════════════════════════════════════════════ */
+int main(void){
+    /* SDL hints for smoother rendering */
+    SDL_SetHint(SDL_HINT_RENDER_VSYNC, "1");
+    SDL_SetHint(SDL_HINT_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR, "0");
+
+    if(SDL_Init(SDL_INIT_VIDEO)<0){
+        fprintf(stderr,"SDL_Init: %s\n",SDL_GetError()); return 1;
+    }
     TTF_Init();
-    IMG_Init(IMG_INIT_JPG | IMG_INIT_PNG | IMG_INIT_WEBP);
+    IMG_Init(IMG_INIT_JPG|IMG_INIT_PNG|IMG_INIT_WEBP);
 
-    gwin = SDL_CreateWindow(
-        "Perfume Store — Product Editor",
-        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-        WIN_W, WIN_H, SDL_WINDOW_SHOWN);
-    gren = SDL_CreateRenderer(gwin, -1,
-        SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
-    SDL_SetRenderDrawBlendMode(gren, SDL_BLENDMODE_BLEND);
+    gwin=SDL_CreateWindow("Perfume Store — Product Editor",
+        SDL_WINDOWPOS_CENTERED,SDL_WINDOWPOS_CENTERED,
+        WIN_W,WIN_H, SDL_WINDOW_SHOWN|SDL_WINDOW_RESIZABLE);
+    if(!gwin){ fprintf(stderr,"Window: %s\n",SDL_GetError()); return 1; }
 
-    gfnt = TTF_OpenFont(FONT_PATH, 14);
-    gfsm = TTF_OpenFont(FONT_PATH, 11);
-    gflg = TTF_OpenFont(FONT_PATH, 17);
+    gren=SDL_CreateRenderer(gwin,-1,
+        SDL_RENDERER_ACCELERATED|SDL_RENDERER_PRESENTVSYNC);
+    if(!gren){ fprintf(stderr,"Renderer: %s\n",SDL_GetError()); return 1; }
 
-    if (!gfnt || !gfsm || !gflg) {
-        fprintf(stderr, "Font load failed: %s\n", TTF_GetError());
-        return 1;
+    SDL_SetRenderDrawBlendMode(gren,SDL_BLENDMODE_BLEND);
+
+    fMD=TTF_OpenFont(FONT_PATH,14);
+    fSM=TTF_OpenFont(FONT_PATH,11);
+    fLG=TTF_OpenFont(FONT_PATH,18);
+    if(!fMD||!fSM||!fLG){
+        fprintf(stderr,"Font: %s\n",TTF_GetError()); return 1;
     }
 
-    memset(&fb, 0, sizeof(fb));
-    ws_init();
+    /* ── init WebSocket in background thread ── */
+    lws_set_log_level(0,NULL);
+    struct lws_context_creation_info info; memset(&info,0,sizeof(info));
+    info.port      = CONTEXT_PORT_NO_LISTEN;
+    info.protocols = ws_protos;
+    info.options   = LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
+    ws_ctx = lws_create_context(&info);
 
-    setup_layout();
-    load_html();
-    if (np > 0) fields_from_prod(0);
+    pthread_t wt;
+    pthread_create(&wt,NULL,ws_thread,NULL);
+    pthread_detach(wt);
 
+    /* ── layout + load ── */
+    layout();
+    html_load();
+    if(np>0) p2f(0);
+
+    /* ── main loop ── */
     SDL_Event ev;
-    while (1) {
-        while (SDL_PollEvent(&ev)) handle_event(&ev);
-        ws_tick();
+    while(1){
+        while(SDL_PollEvent(&ev)) handle(&ev);
+        ws_poll();
         render();
-        SDL_Delay(16);
     }
 
-    TTF_CloseFont(gfnt); TTF_CloseFont(gfsm); TTF_CloseFont(gflg);
-    TTF_Quit(); IMG_Quit();
-    SDL_DestroyRenderer(gren);
-    SDL_DestroyWindow(gwin);
-    SDL_Quit();
+    ws_running=0;
     return 0;
 }
