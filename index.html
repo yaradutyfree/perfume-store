@@ -674,7 +674,7 @@
     grid.innerHTML = products.map(p => `
       <div class="product-card">
         <div class="product-img">
-          ${p.image ? `<img src="${p.image}" alt="${p.name}" />` : `${p.image ? `<img src="${p.image}" alt="${p.name}" />` : `<span>${p.icon}</span>`}`}
+          ${p.image ? `<img src="${p.image}" alt="${p.name}" />` : `${p.image ? `<img src="${p.image}" alt="${p.name}" />` : `${p.image ? `<img src="${p.image}" alt="${p.name}" />` : `${p.image ? `<img src="${p.image}" alt="${p.name}" />` : `${p.image ? `<img src="${p.image}" alt="${p.name}" />` : `<span>${p.icon}</span>`}`}`}`}`}
           ${p.badge ? `<div class="product-badge">${p.badge}</div>` : ""}
         </div>
         <div class="product-info">
@@ -794,7 +794,4 @@
     t.textContent = msg;
     t.classList.add("show");
     clearTimeout(toastTimer);
-    toastTimer = setTimeout(() => t.classList.remove("show"), 2000);
-  }
-
-  // ── INIT ───────────────────────────────────────
+    toastTimer = setTimeout(
