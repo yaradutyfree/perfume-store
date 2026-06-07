@@ -424,10 +424,12 @@
 
   function renderBrands() {
     const bar = document.getElementById('brandsBar');
-    let h = `<button class="brand-pill ${!activeBrand?'active':''}" data-brand="">Todas las Marcas</button>`;
+    let h = `<button class="brand-pill ${!activeBrand?'active':''}" data-brand="">Todas (${products.length})</button>`;
     brands.forEach(b => {
+      const count = products.filter(p => (p.brand||'').toLowerCase() === b.toLowerCase()).length;
+      if (!count) return; /* hide brands with no products */
       const active = activeBrand && activeBrand.toLowerCase()===b.toLowerCase() ? 'active' : '';
-      h += `<button class="brand-pill ${active}" data-brand="${b.replace(/"/g,'&quot;')}">${b}</button>`;
+      h += `<button class="brand-pill ${active}" data-brand="${b.replace(/"/g,'&quot;')}">${b} (${count})</button>`;
     });
     bar.innerHTML = h;
   }
