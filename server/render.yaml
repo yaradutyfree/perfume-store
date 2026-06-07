@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: perfume-store-ws
+    runtime: node
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: ADMIN_SECRET
+        value: YaraOud2024

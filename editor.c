@@ -1,12 +1,13 @@
 /*
  * Perfume Store Product Editor
  * Build: make
- * Features: file browser, clipboard paste, webp/jpg/gif/png support
+ * Features: file browser, clipboard paste, webp/jpg/gif/png, WebSocket live sync
  */
 
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_ttf.h>
 #include <SDL2/SDL_image.h>
+#include <libwebsockets.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,12 +16,19 @@
 #include <sys/types.h>
 #include <dirent.h>
 #include <unistd.h>
+#include <pthread.h>
 
 /* ── Paths ────────────────────────────────────────────────────────── */
 #define HTML_PATH "/home/xmm/Projects/perfume-store/index.html"
 #define IMG_DIR   "/home/xmm/Projects/perfume-store/images"
 #define GIT_DIR   "/home/xmm/Projects/perfume-store"
 #define FONT_PATH "/usr/share/fonts/truetype/lato/Lato-Regular.ttf"
+
+/* ── WebSocket config ─────────────────────────────────────────────── */
+#define WS_HOST   "perfume-store-ws.onrender.com"
+#define WS_PORT   443
+#define WS_PATH   "/"
+#define WS_SECRET "YaraOud2024"
 
 /* ── Window layout ────────────────────────────────────────────────── */
 #define WIN_W    900
@@ -119,9 +127,33 @@ static int          imgw, imgh;
 static char   stmsg[256] = "Ready";
 static Uint32 sttime     = 0;
 
-static SDL_Rect btn_add, btn_del, btn_save, btn_push, btn_browse, btn_paste;
+static SDL_Rect btn_add, btn_del, btn_save, btn_push, btn_browse, btn_paste, btn_wssync;
 static int hov_item = -1;
 static int dirty    = 0;
+
+/* ── WebSocket state ──────────────────────────────────────────────── */
+typedef enum { WS_DISCONNECTED=0, WS_CONNECTING, WS_CONNECTED } WsState;
+
+static struct lws_context *ws_ctx    = NULL;
+static struct lws         *ws_wsi    = NULL;
+static WsState             ws_state  = WS_DISCONNECTED;
+static int                 ws_orders = 0;   /* total orders today       */
+static int                 ws_send_products = 0; /* flag: send products  */
+static pthread_mutex_t     ws_mutex  = PTHREAD_MUTEX_INITIALIZER;
+
+/* notification popup */
+static struct {
+    int      visible;
+    char     name[64];
+    char     city[64];
+    char     total[16];
+    char     items_text[256];
+    Uint32   shown_at;
+} ws_notif;
+
+/* send queue (JSON string) */
+static char ws_send_buf[8192];
+static int  ws_send_len = 0;
 
 /* ═══════════════════════════════════════════════════════════════════
    Drawing helpers
@@ -183,6 +215,221 @@ static void set_status(const char *msg) {
     strncpy(stmsg, msg, sizeof(stmsg) - 1);
     stmsg[sizeof(stmsg)-1] = '\0';
     sttime = SDL_GetTicks();
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   WebSocket — simple JSON helpers (no external lib needed)
+   ═══════════════════════════════════════════════════════════════════ */
+
+/* extract string value from a flat JSON message */
+static int json_str(const char *json, const char *key, char *out, int outsz) {
+    char search[64];
+    snprintf(search, sizeof(search), "\"%s\"", key);
+    const char *p = strstr(json, search);
+    if (!p) return 0;
+    p += strlen(search);
+    while (*p == ':' || *p == ' ') p++;
+    if (*p == '"') {
+        p++;
+        int i = 0;
+        while (*p && *p != '"' && i < outsz-1) out[i++] = *p++;
+        out[i] = '\0'; return 1;
+    }
+    /* number */
+    int i = 0;
+    while (*p && *p != ',' && *p != '}' && i < outsz-1) out[i++] = *p++;
+    out[i] = '\0'; return 1;
+}
+
+/* build products JSON array from current prods[] */
+static void build_products_json(char *out, int outsz) {
+    int pos = 0;
+    pos += snprintf(out+pos, outsz-pos,
+        "{\"type\":\"update_products\",\"secret\":\"%s\",\"products\":[", WS_SECRET);
+    for (int i = 0; i < np && pos < outsz-256; i++) {
+        Prod *p = &prods[i];
+        char badge_js[48], image_js[280];
+        if (p->badge[0]) snprintf(badge_js, sizeof(badge_js), "\"%s\"", p->badge);
+        else strcpy(badge_js, "null");
+        if (p->image[0]) snprintf(image_js, sizeof(image_js), "\"%s\"", p->image);
+        else strcpy(image_js, "null");
+        pos += snprintf(out+pos, outsz-pos,
+            "{\"id\":%d,\"name\":\"%s\",\"desc\":\"%s\","
+            "\"price\":%s,\"size\":\"%s\",\"icon\":\"%s\","
+            "\"badge\":%s,\"image\":%s}%s",
+            p->id, p->name, p->desc,
+            p->price[0] ? p->price : "0",
+            p->size, p->icon[0] ? p->icon : "🌺",
+            badge_js, image_js,
+            i < np-1 ? "," : "");
+    }
+    pos += snprintf(out+pos, outsz-pos, "]}");
+}
+
+/* ── LWS callback ── */
+static int ws_callback(struct lws *wsi, enum lws_callback_reasons reason,
+                       void *user, void *in, size_t len)
+{
+    (void)user;
+    switch (reason) {
+
+        case LWS_CALLBACK_CLIENT_ESTABLISHED:
+            pthread_mutex_lock(&ws_mutex);
+            ws_state = WS_CONNECTED;
+            ws_wsi   = wsi;
+            pthread_mutex_unlock(&ws_mutex);
+            set_status("WebSocket connected — sending auth...");
+            /* request writable to send auth */
+            lws_callback_on_writable(wsi);
+            break;
+
+        case LWS_CALLBACK_CLIENT_WRITEABLE: {
+            pthread_mutex_lock(&ws_mutex);
+            char msg[8192];
+            int  mlen = 0;
+
+            if (ws_send_len > 0) {
+                /* queued message waiting */
+                mlen = ws_send_len;
+                memcpy(msg + LWS_PRE, ws_send_buf, mlen);
+                ws_send_len = 0;
+            } else {
+                /* default: send auth on first connect */
+                mlen = snprintf(msg + LWS_PRE, sizeof(msg) - LWS_PRE,
+                    "{\"type\":\"admin_auth\",\"secret\":\"%s\"}", WS_SECRET);
+            }
+            pthread_mutex_unlock(&ws_mutex);
+
+            if (mlen > 0)
+                lws_write(wsi, (unsigned char*)(msg + LWS_PRE), mlen, LWS_WRITE_TEXT);
+
+            /* check if more to send */
+            pthread_mutex_lock(&ws_mutex);
+            int more = ws_send_products || ws_send_len > 0;
+            pthread_mutex_unlock(&ws_mutex);
+            if (more) lws_callback_on_writable(wsi);
+            break;
+        }
+
+        case LWS_CALLBACK_CLIENT_RECEIVE: {
+            char *json = (char*)in;
+            char  type[32] = {0};
+            json_str(json, "type", type, sizeof(type));
+
+            if (strcmp(type, "state") == 0 || strcmp(type, "ack") == 0) {
+                char cnt[16] = {0};
+                if (json_str(json, "orderCount", cnt, sizeof(cnt)))
+                    ws_orders = atoi(cnt);
+                set_status("WebSocket ready — products synced with live site.");
+            }
+            else if (strcmp(type, "new_order") == 0) {
+                pthread_mutex_lock(&ws_mutex);
+                ws_orders++;
+                json_str(json, "name",  ws_notif.name,       sizeof(ws_notif.name));
+                json_str(json, "city",  ws_notif.city,       sizeof(ws_notif.city));
+                json_str(json, "total", ws_notif.total,      sizeof(ws_notif.total));
+                char cnt[16] = {0};
+                if (json_str(json, "orderCount", cnt, sizeof(cnt)))
+                    ws_orders = atoi(cnt);
+                snprintf(ws_notif.items_text, sizeof(ws_notif.items_text),
+                         "Total: $%s", ws_notif.total);
+                ws_notif.visible  = 1;
+                ws_notif.shown_at = SDL_GetTicks();
+                pthread_mutex_unlock(&ws_mutex);
+                set_status("New order received!");
+            }
+            else if (strcmp(type, "order_count") == 0) {
+                char cnt[16] = {0};
+                json_str(json, "count", cnt, sizeof(cnt));
+                ws_orders = atoi(cnt);
+            }
+            break;
+        }
+
+        case LWS_CALLBACK_CLIENT_CONNECTION_ERROR:
+        case LWS_CALLBACK_CLIENT_CLOSED:
+            pthread_mutex_lock(&ws_mutex);
+            ws_state = WS_DISCONNECTED;
+            ws_wsi   = NULL;
+            pthread_mutex_unlock(&ws_mutex);
+            set_status("WebSocket disconnected — retrying...");
+            break;
+
+        default: break;
+    }
+    return 0;
+}
+
+static struct lws_protocols ws_protocols[] = {
+    { "perfume-store", ws_callback, 0, 65536, 0, NULL, 0 },
+    LWS_PROTOCOL_LIST_TERM
+};
+
+/* send queued message */
+static void ws_queue_send(const char *json) {
+    pthread_mutex_lock(&ws_mutex);
+    int len = (int)strlen(json);
+    if (len < (int)sizeof(ws_send_buf)) {
+        memcpy(ws_send_buf, json, len);
+        ws_send_len = len;
+    }
+    pthread_mutex_unlock(&ws_mutex);
+    if (ws_wsi) lws_callback_on_writable(ws_wsi);
+}
+
+static void ws_sync_products(void) {
+    if (ws_state != WS_CONNECTED) {
+        set_status("Not connected to WebSocket server");
+        return;
+    }
+    char json[8192];
+    build_products_json(json, sizeof(json));
+    ws_queue_send(json);
+    set_status("Products synced to live website via WebSocket!");
+}
+
+static void ws_init(void) {
+    struct lws_context_creation_info info;
+    memset(&info, 0, sizeof(info));
+    info.port      = CONTEXT_PORT_NO_LISTEN;
+    info.protocols = ws_protocols;
+    info.options   = LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
+    lws_set_log_level(0, NULL);
+    ws_ctx = lws_create_context(&info);
+}
+
+static void ws_connect(void) {
+    if (!ws_ctx || ws_state != WS_DISCONNECTED) return;
+
+    struct lws_client_connect_info ccinfo;
+    memset(&ccinfo, 0, sizeof(ccinfo));
+    ccinfo.context      = ws_ctx;
+    ccinfo.address      = WS_HOST;
+    ccinfo.port         = WS_PORT;
+    ccinfo.path         = WS_PATH;
+    ccinfo.host         = WS_HOST;
+    ccinfo.origin       = WS_HOST;
+    ccinfo.protocol     = "perfume-store";
+    ccinfo.ssl_connection = LCCSCF_USE_SSL |
+                            LCCSCF_ALLOW_SELFSIGNED |
+                            LCCSCF_SKIP_SERVER_CERT_HOSTNAME_CHECK;
+
+    ws_state = WS_CONNECTING;
+    ws_wsi   = lws_client_connect_via_info(&ccinfo);
+    if (!ws_wsi) ws_state = WS_DISCONNECTED;
+}
+
+/* ── reconnect timer ── */
+static Uint32 ws_last_try = 0;
+static void ws_tick(void) {
+    if (!ws_ctx) return;
+    lws_service(ws_ctx, 0);
+
+    Uint32 now = SDL_GetTicks();
+    if (ws_state == WS_DISCONNECTED && now - ws_last_try > 5000) {
+        ws_last_try = now;
+        ws_connect();
+    }
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -573,6 +820,7 @@ static void save_html(void) {
     fclose(f);
 
     fix_render_template(buf);
+    sz = (int)strlen(buf);  /* recalculate — template fix may expand buf */
 
     char *arr_start = strstr(buf, "const products = [");
     if (!arr_start) { set_status("ERROR: products marker not found"); free(buf); return; }
@@ -722,9 +970,10 @@ static void setup_layout(void) {
     btn_add = (SDL_Rect){ PAD,           ry + (BTN_BAR-34)/2, bw, 34 };
     btn_del = (SDL_Rect){ PAD + bw + 8,  ry + (BTN_BAR-34)/2, bw, 34 };
 
-    int pw  = 200;
-    btn_save = (SDL_Rect){ WIN_W - PAD - pw*2 - 12, ry + (BTN_BAR-34)/2, pw, 34 };
-    btn_push = (SDL_Rect){ WIN_W - PAD - pw,         ry + (BTN_BAR-34)/2, pw, 34 };
+    int pw  = 164;
+    btn_wssync = (SDL_Rect){ LIST_W+PAD,                         ry + (BTN_BAR-34)/2, pw, 34 };
+    btn_save   = (SDL_Rect){ WIN_W - PAD - pw*2 - 10,            ry + (BTN_BAR-34)/2, pw, 34 };
+    btn_push   = (SDL_Rect){ WIN_W - PAD - pw,                   ry + (BTN_BAR-34)/2, pw, 34 };
 
     int fx = rx + PAD, fw = rw - PAD * 2;
     int fy = 60, gap = TF_H + 24;
@@ -883,6 +1132,22 @@ static void render(void) {
     frect((SDL_Rect){right, 0, WIN_W-right, 40}, C_CARD);
     hline(right, WIN_W, 40, C_BDR);
 
+    /* WS status dot + order counter in header */
+    SDL_Color dot_col = ws_state == WS_CONNECTED    ? (SDL_Color){37,175,85,255} :
+                        ws_state == WS_CONNECTING   ? (SDL_Color){200,160,30,255}
+                                                    : (SDL_Color){165,50,50,255};
+    frect((SDL_Rect){WIN_W-180, 14, 10, 10}, dot_col);
+    frect((SDL_Rect){WIN_W-179, 13, 8,  8},  dot_col);
+
+    char order_txt[48];
+    snprintf(order_txt, sizeof(order_txt), "Orders today: %d", ws_orders);
+    dtext(order_txt, WIN_W-165, 12, gfsm, C_MUTE);
+
+    const char *ws_label = ws_state == WS_CONNECTED  ? "Live" :
+                           ws_state == WS_CONNECTING ? "Connecting..." : "Offline";
+    SDL_Color wslc = ws_state == WS_CONNECTED ? C_GRN : C_MUTE;
+    dtext(ws_label, WIN_W-165, 24, gfsm, wslc);
+
     if (np == 0) {
         SDL_Rect c = {right, 40, WIN_W-right, bary-40};
         dtext_center("No products — click + Add", c, gfnt, C_MUTE);
@@ -933,8 +1198,14 @@ static void render(void) {
     /* ── BOTTOM BAR ── */
     frect((SDL_Rect){right, bary, WIN_W-right, BTN_BAR}, C_CARD);
     hline(right, WIN_W, bary, C_BDR);
-    draw_button(btn_save, "Save & Update HTML", C_GRN, (SDL_Color){10,10,10,255});
-    draw_button(btn_push, "Push to GitHub",     (SDL_Color){25,45,25,255}, C_GRN);
+    /* WS sync button */
+    SDL_Color ws_btn_col = ws_state == WS_CONNECTED
+        ? (SDL_Color){20,50,70,255} : (SDL_Color){30,30,30,255};
+    draw_button(btn_wssync, "Sync via WebSocket", ws_btn_col,
+                ws_state == WS_CONNECTED ? C_TEXT : C_MUTE);
+
+    draw_button(btn_save, "Save HTML",       C_GRN,                   (SDL_Color){10,10,10,255});
+    draw_button(btn_push, "Push to GitHub",  (SDL_Color){25,45,25,255}, C_GRN);
     if (dirty) dtext("*", btn_save.x - 14, btn_save.y + 9, gfnt, C_GOLD);
 
     /* ── STATUS BAR ── */
@@ -942,6 +1213,47 @@ static void render(void) {
     frect((SDL_Rect){0, sy, WIN_W, STAT_H}, C_DARK2);
     hline(0, WIN_W, sy, C_BDR);
     dtext(stmsg, PAD, sy + 6, gfsm, C_MUTE);
+
+    /* ── ORDER NOTIFICATION POPUP ── */
+    pthread_mutex_lock(&ws_mutex);
+    if (ws_notif.visible) {
+        Uint32 age = SDL_GetTicks() - ws_notif.shown_at;
+        if (age > 10000) {
+            ws_notif.visible = 0;
+        } else {
+            /* fade out last 2 seconds */
+            Uint8 alpha = age > 8000 ? (Uint8)(255 - (age-8000)*255/2000) : 255;
+            int nw = 300, nh = 130;
+            SDL_Rect nr = {WIN_W - nw - 12, WIN_H - STAT_H - nh - 12, nw, nh};
+
+            SDL_SetRenderDrawBlendMode(gren, SDL_BLENDMODE_BLEND);
+            SDL_SetRenderDrawColor(gren, 22, 22, 22, alpha);
+            SDL_RenderFillRect(gren, &nr);
+            SDL_SetRenderDrawColor(gren, 37, 175, 85, alpha);
+            SDL_RenderDrawRect(gren, &nr);
+            SDL_SetRenderDrawBlendMode(gren, SDL_BLENDMODE_NONE);
+
+            SDL_Color nc = {240,234,214,alpha};
+            SDL_Color gc = {37,175,85,alpha};
+            SDL_Color mc = {110,110,110,alpha};
+
+            dtext("New Order!", nr.x+12, nr.y+10, gflg, gc);
+            dtext(ws_notif.name[0] ? ws_notif.name : "Customer",
+                  nr.x+12, nr.y+36, gfnt, nc);
+            if (ws_notif.city[0]) dtext(ws_notif.city, nr.x+12, nr.y+54, gfsm, mc);
+            dtext(ws_notif.items_text, nr.x+12, nr.y+72, gfsm, mc);
+
+            char cnt_txt[40];
+            snprintf(cnt_txt, sizeof(cnt_txt), "Order #%d today", ws_orders);
+            dtext(cnt_txt, nr.x+12, nr.y+92, gfsm, gc);
+
+            /* dismiss button */
+            SDL_Rect db = {nr.x+nr.w-70, nr.y+nh-30, 60, 22};
+            frect(db, (SDL_Color){50,50,50,alpha});
+            dtext_center("dismiss", db, gfsm, mc);
+        }
+    }
+    pthread_mutex_unlock(&ws_mutex);
 
     /* ── FILE BROWSER (overlay) ── */
     if (fb.open) fb_draw();
@@ -1144,6 +1456,25 @@ static void handle_event(SDL_Event *e) {
             return;
         }
 
+        /* ws sync */
+        if (pt_in(btn_wssync, mx, my)) {
+            fields_to_prod(sel);
+            ws_sync_products();
+            return;
+        }
+
+        /* dismiss notification */
+        if (ws_notif.visible) {
+            int nw = 300, nh = 130;
+            SDL_Rect db = {WIN_W-nw-12 + nw-70, WIN_H-STAT_H-nh-12 + nh-30, 60, 22};
+            if (pt_in(db, mx, my)) {
+                pthread_mutex_lock(&ws_mutex);
+                ws_notif.visible = 0;
+                pthread_mutex_unlock(&ws_mutex);
+                return;
+            }
+        }
+
         /* save */
         if (pt_in(btn_save, mx, my)) { fields_to_prod(sel); save_html(); return; }
 
@@ -1217,6 +1548,8 @@ int main(void) {
     }
 
     memset(&fb, 0, sizeof(fb));
+    ws_init();
+
     setup_layout();
     load_html();
     if (np > 0) fields_from_prod(0);
@@ -1224,6 +1557,7 @@ int main(void) {
     SDL_Event ev;
     while (1) {
         while (SDL_PollEvent(&ev)) handle_event(&ev);
+        ws_tick();
         render();
         SDL_Delay(16);
     }
