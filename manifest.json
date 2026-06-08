@@ -1,0 +1,22 @@
+{
+  "name": "YaraDutyFree",
+  "short_name": "YaraDutyFree",
+  "description": "Fragancias Árabes — Lujo Oriental",
+  "start_url": "/perfume-store/",
+  "display": "fullscreen",
+  "orientation": "portrait",
+  "background_color": "#080808",
+  "theme_color": "#080808",
+  "icons": [
+    {
+      "src": "icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}

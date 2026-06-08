@@ -2,8 +2,16 @@
 <html lang="es">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
   <title>YaraDutyFree — Fragancias Árabes</title>
+  <!-- PWA -->
+  <link rel="manifest" href="manifest.json">
+  <meta name="theme-color" content="#080808">
+  <meta name="mobile-web-app-capable" content="yes">
+  <!-- iOS fullscreen -->
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="YaraDutyFree">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,400;0,600;0,700;1,400&family=Lato:wght@300;400;700&display=swap" rel="stylesheet">
   <style>
@@ -253,6 +261,10 @@
       .detail-panel { border-radius:4px; border:1px solid var(--bdr); border-top:1px solid var(--bdr); max-height:80vh; }
       @keyframes slideUp { from{opacity:0;transform:translateY(20px)} to{opacity:1;transform:none} }
     }
+
+    /* safe area for notch/island phones */
+    body { padding-top: env(safe-area-inset-top); padding-bottom: env(safe-area-inset-bottom); }
+    .site-header { top: env(safe-area-inset-top); }
   </style>
 </head>
 <body>
@@ -646,6 +658,14 @@
   }
   renderFolders();
   wsConnect();
+
+  /* fullscreen on first touch (mobile) */
+  function tryFullscreen() {
+    const el = document.documentElement;
+    const req = el.requestFullscreen || el.webkitRequestFullscreen || el.mozRequestFullScreen;
+    if (req) req.call(el).catch(() => {});
+  }
+  document.addEventListener('touchstart', tryFullscreen, { once: true });
 </script>
 </body>
 </html>
