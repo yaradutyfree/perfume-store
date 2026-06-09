@@ -132,7 +132,7 @@ static int wev_pop(WEvent *out) {
 
 /* ── WS send queue (main-thread → ws-thread) ────────────────── */
 #define WSQ_CAP 4
-static char       wsq_buf[WSQ_CAP][8192];
+static char      *wsq_buf[WSQ_CAP]; /* heap-allocated, any size */
 static int        wsq_head = 0, wsq_tail = 0;
 static pthread_mutex_t wsq_mtx = PTHREAD_MUTEX_INITIALIZER;
 static struct lws_context *ws_ctx = NULL;
@@ -143,7 +143,8 @@ static void wsq_push(const char *json) {
     pthread_mutex_lock(&wsq_mtx);
     int next = (wsq_tail + 1) % WSQ_CAP;
     if (next != wsq_head) {
-        strncpy(wsq_buf[wsq_tail], json, 8191);
+        free(wsq_buf[wsq_tail]);
+        wsq_buf[wsq_tail] = strdup(json);
         wsq_tail = next;
     }
     pthread_mutex_unlock(&wsq_mtx);
@@ -377,27 +378,36 @@ static int ws_cb(struct lws *wsi, enum lws_callback_reasons reason,
         break;
 
     case LWS_CALLBACK_CLIENT_WRITEABLE: {
-        /* send auth first, then any queued messages */
-        char msg[8192+LWS_PRE];
-        int  mlen = 0;
+        char *payload = NULL;
+        int   mlen = 0;
+        int   free_payload = 0;
 
         pthread_mutex_lock(&wsq_mtx);
         if(!ws_authed){
-            mlen = snprintf(msg+LWS_PRE, sizeof(msg)-LWS_PRE,
+            static char auth[256];
+            mlen = snprintf(auth, sizeof(auth),
                 "{\"type\":\"admin_auth\",\"secret\":\"%s\"}", WS_SECRET);
+            payload = auth;
             ws_authed = 1;
         } else if(wsq_head != wsq_tail){
-            mlen = (int)strlen(wsq_buf[wsq_head]);
-            memcpy(msg+LWS_PRE, wsq_buf[wsq_head], mlen);
+            payload = wsq_buf[wsq_head];
+            wsq_buf[wsq_head] = NULL;
             wsq_head = (wsq_head+1) % WSQ_CAP;
+            free_payload = 1;
         }
         int more = (wsq_head != wsq_tail);
         pthread_mutex_unlock(&wsq_mtx);
 
-        if(mlen>0)
-            lws_write(wsi,(unsigned char*)(msg+LWS_PRE),mlen,LWS_WRITE_TEXT);
-        if(more)
-            lws_callback_on_writable(wsi);
+        if(payload && (mlen = mlen ? mlen : (int)strlen(payload)) > 0){
+            unsigned char *buf = malloc(LWS_PRE + mlen);
+            if(buf){
+                memcpy(buf+LWS_PRE, payload, mlen);
+                lws_write(wsi, buf+LWS_PRE, mlen, LWS_WRITE_TEXT);
+                free(buf);
+            }
+            if(free_payload) free(payload);
+        }
+        if(more) lws_callback_on_writable(wsi);
         break;
     }
 
