@@ -1036,9 +1036,11 @@ static void paste_clip(void){
         }
         SDL_free(clip);
     }
-    /* try X clipboard image */
-    const char *tmp="/tmp/_cb.png";
-    if(!system("xclip -selection clipboard -t image/png -o > /tmp/_cb.png 2>/dev/null")){
+    /* try X clipboard image — use product ID in filename to avoid overwriting */
+    char tmp[64]; snprintf(tmp,sizeof(tmp),"/tmp/prod_%d_cb.png",prods[sel].id);
+    char xcmd[128]; snprintf(xcmd,sizeof(xcmd),
+        "xclip -selection clipboard -t image/png -o > %s 2>/dev/null",tmp);
+    if(!system(xcmd)){
         struct stat st; stat(tmp,&st);
         if(st.st_size>0){
             char rel[256];
