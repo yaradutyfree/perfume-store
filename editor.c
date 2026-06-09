@@ -828,11 +828,53 @@ static void html_save(void){
     dirty=0; set_st("HTML saved! Use Push or Sync to publish.");
 }
 
+static const char B64T[]="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+static void write_img_b64(FILE *out, const char *relpath);
+
+/* ═══════════════════════════════════════════════════════════════
+   Write data.json (base64 images) for Android app
+   ═══════════════════════════════════════════════════════════════ */
+static void data_json_save(void){
+    char path[512]; snprintf(path,sizeof(path),"%s/data.json",GIT_DIR);
+    FILE *out=fopen(path,"wb"); if(!out) return;
+    time_t t=time(NULL); struct tm *lt=localtime(&t);
+    char ts[32]; strftime(ts,sizeof(ts),"%Y-%m-%dT%H:%M:%S",lt);
+    fprintf(out,"{\n  \"version\": 1,\n  \"timestamp\": \"%s\",\n",ts);
+    fprintf(out,"  \"brands\": [");
+    for(int i=0;i<nb;i++) fprintf(out,"\"%s\"%s",brands[i],i<nb-1?",":"");
+    fprintf(out,"],\n");
+    fprintf(out,"  \"products\": [\n");
+    for(int i=0;i<np;i++){
+        Prod *p=&prods[i];
+        char bj[80],brj[80],spj[40];
+        if(p->badge[0]) snprintf(bj,sizeof(bj),"\"%s\"",p->badge); else strcpy(bj,"null");
+        if(p->brand[0]) snprintf(brj,sizeof(brj),"\"%s\"",p->brand); else strcpy(brj,"null");
+        if(p->sale_price[0]) snprintf(spj,sizeof(spj),"%s",p->sale_price); else strcpy(spj,"null");
+        fprintf(out,"    {\n");
+        fprintf(out,"      \"id\": %d,\n",p->id);
+        fprintf(out,"      \"name\": \"%s\",\n",p->name);
+        fprintf(out,"      \"desc\": \"%s\",\n",p->desc);
+        fprintf(out,"      \"price\": %s,\n",p->price[0]?p->price:"0");
+        fprintf(out,"      \"salePrice\": %s,\n",spj);
+        fprintf(out,"      \"size\": \"%s\",\n",p->size);
+        fprintf(out,"      \"icon\": \"%s\",\n",p->icon[0]?p->icon:"🌹");
+        fprintf(out,"      \"badge\": %s,\n",bj);
+        fprintf(out,"      \"brand\": %s,\n",brj);
+        fprintf(out,"      \"inStock\": %s,\n",p->in_stock?"true":"false");
+        fprintf(out,"      \"image\": ");
+        if(p->image[0]) write_img_b64(out,p->image); else fputs("null",out);
+        fprintf(out,"\n    }%s\n",i<np-1?",":"");
+    }
+    fprintf(out,"  ]\n}\n");
+    fclose(out);
+}
+
 /* ═══════════════════════════════════════════════════════════════
    Git push
    ═══════════════════════════════════════════════════════════════ */
 static void git_push(void){
     set_st("Pushing to GitHub...");
+    data_json_save(); /* keep data.json in sync for Android app */
     char cmd[512];
     snprintf(cmd,sizeof(cmd),
         "cd %s && git add -A && git commit -m 'Update products' && git push 2>&1",GIT_DIR);
@@ -1130,7 +1172,6 @@ static void hist_draw(void){
 /* ═══════════════════════════════════════════════════════════════
    Backup / Restore
    ═══════════════════════════════════════════════════════════════ */
-static const char B64T[]="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 /* write image file as base64 data-URL directly to output file */
 static void write_img_b64(FILE *out, const char *relpath){
