@@ -16,6 +16,8 @@
 #include <dirent.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <time.h>
+#include <math.h>
 
 /* ── Paths ─────────────────────────────────────────────────── */
 #define HTML_PATH  "/home/xmm/Projects/perfume-store/index.html"
@@ -36,6 +38,10 @@
 #define PAD        14
 #define TF_H       36
 #define ITEM_H     50
+#define LIST_TOP   80       /* list starts below search bar */
+
+/* ── Orders log ─────────────────────────────────────────────── */
+#define ORDERS_FILE "/home/xmm/Projects/perfume-store/orders.jsonl"
 
 /* ── Limits ─────────────────────────────────────────────────── */
 #define MAX_PRODS  32
@@ -44,23 +50,25 @@
 #define FB_ROW      28
 
 /* ── Colors ─────────────────────────────────────────────────── */
-#define C(r,g,b)  ((SDL_Color){r,g,b,255})
+#define C(r,g,b)    ((SDL_Color){r,g,b,255})
+#define CA(r,g,b,a) ((SDL_Color){r,g,b,a})
 static const SDL_Color
-    BG    = C( 12, 12, 12),
-    PANEL = C( 20, 20, 20),
-    CARD  = C( 26, 26, 26),
-    BDR   = C( 42, 42, 42),
-    GOLD  = C(201,168, 76),
-    LGOLD = C(228,198,118),
-    TEXT  = C(240,234,214),
-    MUTED = C(105,105,105),
-    SELB  = C( 38, 30,  8),
-    HOVB  = C( 26, 22,  6),
-    GRN   = C( 37,175, 85),
-    RED   = C(160, 48, 48),
-    BLUE  = C( 60,110,200),
-    FBHOV = C( 28, 36, 50),
-    FBSEL = C( 38, 58, 90);
+    BG    = C(  6,  5,  9),
+    PANEL = C( 11, 10, 17),
+    CARD  = C( 17, 15, 26),
+    BDR   = C( 44, 40, 66),
+    GOLD  = C(212,175, 55),
+    LGOLD = C(248,215,100),
+    DGOLD = C(130,100, 22),
+    TEXT  = C(242,236,222),
+    MUTED = C( 95, 88,108),
+    SELB  = C( 32, 24,  5),
+    HOVB  = C( 22, 17,  4),
+    GRN   = C( 42,195, 92),
+    RED   = C(190, 52, 52),
+    BLUE  = C( 55,120,225),
+    FBHOV = C( 22, 28, 48),
+    FBSEL = C( 32, 52, 88);
 
 /* ── Product ─────────────────────────────────────────────────── */
 typedef struct {
@@ -181,10 +189,44 @@ static char   stmsg[256] = "Loading...";
 static SDL_Rect
     btn_add, btn_del,
     btn_browse, btn_paste, btn_instock,
-    btn_save, btn_push, btn_wssync, btn_brands;
+    btn_save, btn_push, btn_wssync, btn_brands,
+    btn_backup, btn_restore;
 
 static int hov_item = -1;
 static int dirty    = 0;
+
+/* ── Search ──────────────────────────────────────────────────── */
+static char     search_buf[64]  = {0};
+static int      search_len      = 0;
+static int      search_active   = 0;
+static SDL_Rect search_rect;
+static int      filt[MAX_PRODS];   /* filtered product indices */
+static int      nf = 0;
+
+/* ── Drag-to-reorder ─────────────────────────────────────────── */
+static struct {
+    int active;    /* dragging in progress */
+    int held;      /* mouse button held, might start drag */
+    int from_fi;   /* filtered index being dragged */
+    int to_fi;     /* insertion point (filtered index) */
+    int start_y;
+    int cur_y;
+} drag;
+
+/* ── Order history panel ─────────────────────────────────────── */
+#define HIST_LINES 200
+static struct {
+    int      open;
+    int      scroll;
+    char     lines[HIST_LINES][192];
+    int      nlines;
+    SDL_Rect rect;
+} hist;
+static SDL_Rect btn_history;
+
+/* full order JSON from WS thread → main thread */
+static char     order_json_buf[4096] = {0};
+static pthread_mutex_t order_json_mtx = PTHREAD_MUTEX_INITIALIZER;
 
 /* file browser */
 static struct {
@@ -247,8 +289,54 @@ static void dtctr(const char *t,SDL_Rect r,TTF_Font *f,SDL_Color c){
     SDL_RenderCopy(gren,tx,NULL,&d); SDL_DestroyTexture(tx);
 }
 
+/* vertical gradient fill (scanline-by-scanline) */
+static void frgrad(SDL_Rect r,SDL_Color t,SDL_Color b){
+    if(r.h<=0||r.w<=0) return;
+    SDL_SetRenderDrawBlendMode(gren,SDL_BLENDMODE_NONE);
+    for(int i=0;i<r.h;i++){
+        float p=(float)i/(r.h>1?r.h-1:1);
+        SDL_SetRenderDrawColor(gren,
+            (Uint8)(t.r+(b.r-t.r)*p),
+            (Uint8)(t.g+(b.g-t.g)*p),
+            (Uint8)(t.b+(b.b-t.b)*p),255);
+        SDL_RenderDrawLine(gren,r.x,r.y+i,r.x+r.w-1,r.y+i);
+    }
+}
+/* outer glow — expanding rects with decaying alpha */
+static void glow(SDL_Rect r,SDL_Color c,int layers){
+    SDL_SetRenderDrawBlendMode(gren,SDL_BLENDMODE_BLEND);
+    for(int i=layers;i>0;i--){
+        SDL_Rect g={r.x-i,r.y-i,r.w+i*2,r.h+i*2};
+        SDL_SetRenderDrawColor(gren,c.r,c.g,c.b,(Uint8)(55/i));
+        SDL_RenderDrawRect(gren,&g);
+    }
+    SDL_SetRenderDrawBlendMode(gren,SDL_BLENDMODE_NONE);
+}
+/* top shine — two semi-transparent white lines */
+static void shine(SDL_Rect r){
+    SDL_SetRenderDrawBlendMode(gren,SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(gren,255,255,255,40);
+    SDL_RenderDrawLine(gren,r.x+1,r.y+1,r.x+r.w-2,r.y+1);
+    SDL_SetRenderDrawColor(gren,255,255,255,16);
+    SDL_RenderDrawLine(gren,r.x+2,r.y+2,r.x+r.w-3,r.y+2);
+    SDL_SetRenderDrawBlendMode(gren,SDL_BLENDMODE_NONE);
+}
+/* bottom shadow line */
+static void shadow_line(SDL_Rect r){
+    SDL_SetRenderDrawBlendMode(gren,SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(gren,0,0,0,80);
+    SDL_RenderDrawLine(gren,r.x+1,r.y+r.h-1,r.x+r.w-2,r.y+r.h-1);
+    SDL_SetRenderDrawBlendMode(gren,SDL_BLENDMODE_NONE);
+}
+/* elegant button: gradient + gold border on hover, shine, shadow */
 static void btn(SDL_Rect r,const char *lbl,SDL_Color bg,SDL_Color fg){
-    fr(r,bg); dr(r,BDR); dtctr(lbl,r,fMD,fg);
+    SDL_Color top={bg.r+18>255?255:bg.r+18, bg.g+14>255?255:bg.g+14, bg.b+22>255?255:bg.b+22,255};
+    SDL_Color bot={bg.r>12?bg.r-12:0,       bg.g>10?bg.g-10:0,       bg.b>16?bg.b-16:0,       255};
+    frgrad(r,top,bot);
+    dr(r,BDR);
+    shine(r);
+    shadow_line(r);
+    dtctr(lbl,r,fMD,fg);
 }
 
 static void set_st(const char *m){
@@ -323,6 +411,11 @@ static int ws_cb(struct lws *wsi, enum lws_callback_reasons reason,
             wev_push(WEV_SYNCED, NULL);
         }
         else if(!strcmp(type,"new_order")){
+            /* save full JSON for order history */
+            pthread_mutex_lock(&order_json_mtx);
+            strncpy(order_json_buf,(char*)in,4095); order_json_buf[4095]=0;
+            pthread_mutex_unlock(&order_json_mtx);
+
             pthread_mutex_lock(&notif_mtx);
             char cnt[16]={0};
             jstr(j,"name",  notif.name,  sizeof(notif.name));
@@ -431,6 +524,9 @@ static void ws_send_products(void){
     set_st("Syncing products to live website...");
 }
 
+static size_t b64_to_file(const char*,size_t,const char*); /* forward decl */
+static char  *jfield_big(const char*,const char*);         /* forward decl */
+
 /* ═══════════════════════════════════════════════════════════════
    Image
    ═══════════════════════════════════════════════════════════════ */
@@ -440,8 +536,22 @@ static void img_free(void){
 static void img_load(const char *path){
     img_free();
     if(!path||!path[0]) return;
-    SDL_Surface *s=IMG_Load(path);
-    if(!s){ char full[512]; snprintf(full,sizeof(full),"%s/%s",GIT_DIR,path); s=IMG_Load(full); }
+    SDL_Surface *s=NULL;
+
+    if(strncmp(path,"data:",5)==0){
+        /* base64 data URL — decode to temp file then load */
+        const char *comma=strchr(path,',');
+        if(!comma) return;
+        comma++;
+        size_t blen=strlen(comma);
+        const char *tmp="/tmp/ydf_preview_img";
+        b64_to_file(comma,blen,tmp);
+        s=IMG_Load(tmp);
+    } else {
+        s=IMG_Load(path);
+        if(!s){ char full[512]; snprintf(full,sizeof(full),"%s/%s",GIT_DIR,path); s=IMG_Load(full); }
+    }
+
     if(!s) return;
     imgw=s->w; imgh=s->h;
     imgtex=SDL_CreateTextureFromSurface(gren,s); SDL_FreeSurface(s);
@@ -487,6 +597,32 @@ static int exfield(const char *blk,const char *key,char *out,int sz){
     if(!strncmp(p,"null",4)){ out[0]=0; return 1; }
     int i=0; while(*p&&*p!=','&&*p!='}'&&*p!='\n'&&*p!='\r'&&i<sz-1) out[i++]=*p++;
     while(i>0&&isspace((unsigned char)out[i-1])) i--; out[i]=0; return 1;
+}
+
+static void apply_filter(void);                          /* forward decl */
+
+/* Like exfield but returns malloc'd full string value (handles quoted + unquoted JS keys) */
+static char *exfield_big(const char *blk, const char *key){
+    char qk[80]; snprintf(qk,sizeof(qk),"\"%s\"",key);
+    const char *p=strstr(blk,qk);
+    if(p){ p+=strlen(qk); }
+    else {
+        const char *q=blk; int kl=(int)strlen(key);
+        while(*q){
+            if(!isalnum((unsigned char)*q)&&*q!='_'){
+                if(!strncmp(q+1,key,kl)&&q[1+kl]==':'){p=q+1+kl; break;}
+            }
+            q++;
+        }
+    }
+    if(!p) return NULL;
+    while(*p==':'||*p==' ') p++;
+    if(*p!='"') return NULL;
+    p++;
+    const char *s=p; size_t len=0;
+    while(*p&&*p!='"'){ p++; len++; }
+    char *out=malloc(len+1); if(!out) return NULL;
+    memcpy(out,s,len); out[len]=0; return out;
 }
 
 static void html_load(void){
@@ -550,6 +686,22 @@ static void html_load(void){
         exfield(blk,"salePrice", pr->sale_price, sizeof(pr->sale_price));
         if(!strcmp(pr->badge,"null"))      pr->badge[0]=0;
         if(!strcmp(pr->image,"null"))      pr->image[0]=0;
+        /* if image is a base64 data URL, decode to local file */
+        if(strncmp(pr->image,"data:",5)==0){
+            char *b64full=exfield_big(blk,"image");
+            if(b64full&&b64full[0]){
+                const char *comma=strchr(b64full,',');
+                if(comma){
+                    comma++;
+                    mkdir(IMG_DIR,0755);
+                    char imgpath[512];
+                    snprintf(imgpath,sizeof(imgpath),"%s/prod_%d.jpg",IMG_DIR,pr->id);
+                    if(b64_to_file(comma,strlen(comma),imgpath)>0)
+                        snprintf(pr->image,sizeof(pr->image),"images/prod_%d.jpg",pr->id);
+                }
+            }
+            free(b64full);
+        }
         if(!strcmp(pr->brand,"null"))      pr->brand[0]=0;
         if(!strcmp(pr->sale_price,"null")) pr->sale_price[0]=0;
         /* inStock: default true; false only if explicitly "false" */
@@ -560,6 +712,7 @@ static void html_load(void){
         free(blk); p=cb;
     }
     free(buf);
+    apply_filter();
     char msg[80]; snprintf(msg,sizeof(msg),"Loaded %d products, %d brands",np,nb);
     set_st(msg); dirty=0;
 }
@@ -852,6 +1005,368 @@ static void paste_clip(void){
 }
 
 /* ═══════════════════════════════════════════════════════════════
+   Search / Filter
+   ═══════════════════════════════════════════════════════════════ */
+static void apply_filter(void){
+    nf=0;
+    if(!search_buf[0]){
+        for(int i=0;i<np;i++) filt[nf++]=i;
+        return;
+    }
+    char q[64]; strncpy(q,search_buf,63); q[63]=0;
+    for(char *p=q;*p;p++) *p=(char)tolower((unsigned char)*p);
+    for(int i=0;i<np;i++){
+        char n[64],d[128],b[48];
+        strncpy(n,prods[i].name,63); n[63]=0;
+        strncpy(d,prods[i].desc,127); d[127]=0;
+        strncpy(b,prods[i].brand,47); b[47]=0;
+        for(char *p=n;*p;p++) *p=(char)tolower((unsigned char)*p);
+        for(char *p=d;*p;p++) *p=(char)tolower((unsigned char)*p);
+        for(char *p=b;*p;p++) *p=(char)tolower((unsigned char)*p);
+        if(strstr(n,q)||strstr(d,q)||strstr(b,q)) filt[nf++]=i;
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Order History
+   ═══════════════════════════════════════════════════════════════ */
+static void save_order(void){
+    pthread_mutex_lock(&order_json_mtx);
+    char jcopy[4096]; strncpy(jcopy,order_json_buf,4095); jcopy[4095]=0;
+    pthread_mutex_unlock(&order_json_mtx);
+    if(!jcopy[0]) return;
+
+    char name[64]={0},city[64]={0},total[32]={0},phone[32]={0};
+    jstr(jcopy,"name",  name,  sizeof(name));
+    jstr(jcopy,"city",  city,  sizeof(city));
+    jstr(jcopy,"total", total, sizeof(total));
+    jstr(jcopy,"phone", phone, sizeof(phone));
+
+    time_t now=time(NULL);
+    struct tm *lt=localtime(&now);
+    char ts[32]; strftime(ts,sizeof(ts),"%Y-%m-%d %H:%M",lt);
+
+    FILE *f=fopen(ORDERS_FILE,"a");
+    if(!f) return;
+    fprintf(f,"{\"ts\":\"%s\",\"name\":\"%s\",\"city\":\"%s\",\"phone\":\"%s\",\"total\":\"%s\"}\n",
+        ts, name[0]?name:"?", city[0]?city:"", phone[0]?phone:"", total[0]?total:"?");
+    fclose(f);
+}
+
+static void load_hist(void){
+    hist.nlines=0; hist.scroll=0;
+    FILE *f=fopen(ORDERS_FILE,"r"); if(!f) return;
+    /* read all lines into a temp array, then reverse */
+    static char tmp[HIST_LINES][192];
+    int n=0;
+    char line[512];
+    while(fgets(line,sizeof(line),f)&&n<HIST_LINES){
+        int ll=strlen(line);
+        while(ll>0&&(line[ll-1]=='\n'||line[ll-1]=='\r')) line[--ll]=0;
+        if(!ll) continue;
+        /* parse and format */
+        char ts[32]={0},name[64]={0},city[64]={0},phone[32]={0},total[32]={0};
+        jstr(line,"ts",    ts,   sizeof(ts));
+        jstr(line,"name",  name, sizeof(name));
+        jstr(line,"city",  city, sizeof(city));
+        jstr(line,"phone", phone,sizeof(phone));
+        jstr(line,"total", total,sizeof(total));
+        snprintf(tmp[n],sizeof(tmp[n]),"%s  %-20s  %s%s  $%s",
+            ts, name,
+            city[0]?city:"", phone[0]?" / ":"", total);
+        n++;
+    }
+    fclose(f);
+    /* reverse so newest first */
+    for(int i=0;i<n;i++)
+        strncpy(hist.lines[i],tmp[n-1-i],191);
+    hist.nlines=n;
+}
+
+static void hist_draw(void){
+    SDL_Rect r=hist.rect;
+    fr(r,C(16,16,16)); dr(r,GOLD);
+    dt("Historial de Pedidos",r.x+PAD,r.y+10,fLG,GOLD);
+    SDL_Rect xb={r.x+r.w-34,r.y+8,26,26};
+    fr(xb,C(40,14,14)); dr(xb,RED); dtctr("X",xb,fMD,RED);
+
+    hl(r.x,r.x+r.w,r.y+40,BDR);
+
+    if(hist.nlines==0){
+        dt("No hay pedidos guardados.",r.x+PAD,r.y+54,fMD,MUTED);
+    } else {
+        int row_h=28, vis=(r.h-52)/row_h;
+        int max_s=hist.nlines-vis; if(max_s<0) max_s=0;
+        if(hist.scroll>max_s) hist.scroll=max_s;
+        SDL_RenderSetClipRect(gren,&(SDL_Rect){r.x,r.y+42,r.w,r.h-52});
+        for(int i=0;i<hist.nlines;i++){
+            int iy=r.y+42+(i-hist.scroll)*row_h;
+            if(iy+row_h<r.y+42||iy>r.y+r.h-10) continue;
+            SDL_Color tc=(i%2==0)?TEXT:MUTED;
+            dt(hist.lines[i],r.x+PAD,iy+6,fSM,tc);
+            hl(r.x,r.x+r.w,iy+row_h-1,BDR);
+        }
+        SDL_RenderSetClipRect(gren,NULL);
+        /* scrollbar */
+        if(hist.nlines>vis){
+            int sbh=r.h-52,sby=r.y+42;
+            int th=sbh*vis/hist.nlines;
+            int ty=sby+(hist.scroll*(sbh-th))/(hist.nlines-vis);
+            fr((SDL_Rect){r.x+r.w-5,sby,4,sbh},C(30,30,30));
+            fr((SDL_Rect){r.x+r.w-5,ty,4,th},MUTED);
+        }
+        /* count */
+        char cnt[32]; snprintf(cnt,sizeof(cnt),"%d pedido%s",hist.nlines,hist.nlines!=1?"s":"");
+        dt(cnt,r.x+PAD,r.y+r.h-20,fSM,MUTED);
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Backup / Restore
+   ═══════════════════════════════════════════════════════════════ */
+static const char B64T[]="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/* write image file as base64 data-URL directly to output file */
+static void write_img_b64(FILE *out, const char *relpath){
+    char full[512];
+    FILE *f=fopen(relpath,"rb");
+    if(!f){ snprintf(full,sizeof(full),"%s/%s",GIT_DIR,relpath); f=fopen(full,"rb"); }
+    if(!f){ fputs("null",out); return; }
+    const char *ext=strrchr(relpath,'.'); if(!ext) ext=".jpg";
+    char mime[32];
+    if(!strcasecmp(ext+1,"jpg")||!strcasecmp(ext+1,"jpeg")) strcpy(mime,"image/jpeg");
+    else snprintf(mime,sizeof(mime),"image/%s",ext+1);
+    fprintf(out,"\"data:%s;base64,",mime);
+    unsigned char ib[3]; size_t n;
+    while((n=fread(ib,1,3,f))>0){
+        unsigned char b0=ib[0],b1=(n>1?ib[1]:0),b2=(n>2?ib[2]:0);
+        fputc(B64T[(b0>>2)&0x3F],out);
+        fputc(B64T[((b0&3)<<4)|((b1>>4)&0xF)],out);
+        fputc(n>1?B64T[((b1&0xF)<<2)|((b2>>6)&3)]:'=',out);
+        fputc(n>2?B64T[b2&0x3F]:'=',out);
+    }
+    fclose(f); fputc('"',out);
+}
+
+/* JSON-escape a string directly to file */
+static void fj(FILE *out, const char *s){
+    if(!s||!s[0]){ fputs("null",out); return; }
+    fputc('"',out);
+    for(;*s;s++){
+        if(*s=='"')  fputs("\\\"",out);
+        else if(*s=='\\') fputs("\\\\",out);
+        else if(*s=='\n') fputs("\\n",out);
+        else fputc(*s,out);
+    }
+    fputc('"',out);
+}
+
+static void do_backup(void){
+    /* ask for save path via zenity */
+    char path[512]={0};
+    time_t now=time(NULL);
+    struct tm *lt=localtime(&now);
+    char defname[80];
+    strftime(defname,sizeof(defname),"yaradutyfree_backup_%Y%m%d_%H%M%S.json",lt);
+    char cmd[700];
+    snprintf(cmd,sizeof(cmd),
+        "zenity --file-selection --save --confirm-overwrite "
+        "--filename=\"%s/%s\" 2>/dev/null",
+        getenv("HOME")?getenv("HOME"):"/home/xmm", defname);
+    FILE *zp=popen(cmd,"r");
+    if(!zp){ set_st("ERROR: zenity not found"); return; }
+    fgets(path,sizeof(path),zp); pclose(zp);
+    int pl=strlen(path);
+    while(pl>0&&(path[pl-1]=='\n'||path[pl-1]=='\r')) path[--pl]=0;
+    if(!pl){ set_st("Backup cancelled"); return; }
+
+    FILE *out=fopen(path,"wb");
+    if(!out){ set_st("ERROR: cannot create backup file"); return; }
+    set_st("Saving backup...");
+
+    char ts[32]; strftime(ts,sizeof(ts),"%Y-%m-%dT%H:%M:%S",lt);
+    fprintf(out,"{\n  \"version\": 1,\n  \"timestamp\": \"%s\",\n",ts);
+
+    /* brands */
+    fprintf(out,"  \"brands\": [");
+    for(int i=0;i<nb;i++) fprintf(out,"\"%s\"%s",brands[i],i<nb-1?",":"");
+    fprintf(out,"],\n");
+
+    /* products */
+    fprintf(out,"  \"products\": [\n");
+    for(int i=0;i<np;i++){
+        Prod *p=&prods[i];
+        fprintf(out,"    {\n");
+        fprintf(out,"      \"id\": %d,\n",p->id);
+        fprintf(out,"      \"name\": "); fj(out,p->name); fprintf(out,",\n");
+        fprintf(out,"      \"desc\": "); fj(out,p->desc); fprintf(out,",\n");
+        fprintf(out,"      \"price\": %s,\n",p->price[0]?p->price:"0");
+        fprintf(out,"      \"salePrice\": %s,\n",p->sale_price[0]?p->sale_price:"null");
+        fprintf(out,"      \"size\": "); fj(out,p->size); fprintf(out,",\n");
+        fprintf(out,"      \"icon\": "); fj(out,p->icon[0]?p->icon:"🌹"); fprintf(out,",\n");
+        fprintf(out,"      \"badge\": "); fj(out,p->badge); fprintf(out,",\n");
+        fprintf(out,"      \"brand\": "); fj(out,p->brand); fprintf(out,",\n");
+        fprintf(out,"      \"inStock\": %s,\n",p->in_stock?"true":"false");
+        fprintf(out,"      \"image\": ");
+        if(p->image[0]) write_img_b64(out,p->image);
+        else fputs("null",out);
+        fprintf(out,"\n    }%s\n",i<np-1?",":"");
+    }
+    fprintf(out,"  ]\n}\n");
+    fclose(out);
+    char msg[128]; snprintf(msg,sizeof(msg),"Backup saved: %d products",np);
+    set_st(msg);
+}
+
+static int b64val(char c){
+    if(c>='A'&&c<='Z') return c-'A';
+    if(c>='a'&&c<='z') return c-'a'+26;
+    if(c>='0'&&c<='9') return c-'0'+52;
+    if(c=='+') return 62; if(c=='/') return 63; return -1;
+}
+
+/* decode base64 string to a file, return bytes written */
+static size_t b64_to_file(const char *b64, size_t blen, const char *outpath){
+    FILE *f=fopen(outpath,"wb"); if(!f) return 0;
+    size_t written=0;
+    for(size_t i=0;i<blen;){
+        int v[4]={0,0,0,0}; int k=0;
+        while(k<4&&i<blen){
+            char c=b64[i++];
+            if(c=='='){v[k++]=0;}
+            else{ int x=b64val(c); if(x>=0) v[k++]=x; }
+        }
+        if(k<2) break;
+        fputc((v[0]<<2)|(v[1]>>4),f); written++;
+        if(k>2){ fputc(((v[1]&0xF)<<4)|(v[2]>>2),f); written++; }
+        if(k>3){ fputc(((v[2]&3)<<6)|v[3],f); written++; }
+    }
+    fclose(f); return written;
+}
+
+/* find next JSON object { } in array, return pointer and set *endp past it */
+static const char *next_obj(const char *p, const char **endp){
+    while(*p&&*p!='{'&&*p!=']') p++;
+    if(!*p||*p==']') return NULL;
+    const char *start=p++; int depth=1;
+    while(*p&&depth>0){
+        if(*p=='"'){ p++; while(*p&&*p!='"'){ if(*p=='\\') p++; p++; } }
+        else if(*p=='{') depth++;
+        else if(*p=='}') depth--;
+        p++;
+    }
+    if(endp) *endp=p;
+    return start;
+}
+
+/* allocate and return value of a JSON string field (caller frees), handles large values */
+static char *jfield_big(const char *json, const char *key){
+    char kbuf[80]; snprintf(kbuf,sizeof(kbuf),"\"%s\"",key);
+    const char *p=strstr(json,kbuf); if(!p) return NULL;
+    p+=strlen(kbuf);
+    while(*p==':'||*p==' '||*p=='\t') p++;
+    if(strncmp(p,"null",4)==0) return strdup("");
+    if(*p!='"') return NULL; p++;
+    const char *s=p; size_t len=0;
+    while(*p&&!(*p=='"'&&*(p-1)!='\\')){ p++; len++; }
+    char *out=malloc(len+1); if(!out) return NULL;
+    memcpy(out,s,len); out[len]=0; return out;
+}
+
+static void do_restore(void){
+    char path[512]={0};
+    char cmd[256]="zenity --file-selection --file-filter=\"JSON files | *.json\" 2>/dev/null";
+    FILE *zp=popen(cmd,"r");
+    if(!zp){ set_st("ERROR: zenity not found"); return; }
+    fgets(path,sizeof(path),zp); pclose(zp);
+    int pl=strlen(path);
+    while(pl>0&&(path[pl-1]=='\n'||path[pl-1]=='\r')) path[--pl]=0;
+    if(!pl){ set_st("Restore cancelled"); return; }
+
+    /* read entire file */
+    FILE *f=fopen(path,"rb"); if(!f){ set_st("ERROR: cannot open file"); return; }
+    fseek(f,0,SEEK_END); long fsz=ftell(f); rewind(f);
+    char *json=malloc(fsz+1); if(!json){ fclose(f); set_st("ERROR: out of memory"); return; }
+    fread(json,1,fsz,f); fclose(f); json[fsz]=0;
+
+    /* brands */
+    const char *barr=strstr(json,"\"brands\"");
+    if(barr){ barr=strchr(barr,'['); if(barr){ barr++;
+        nb=0;
+        while(nb<MAX_BRANDS){
+            while(*barr&&*barr!='"'&&*barr!=']') barr++;
+            if(!*barr||*barr==']') break;
+            barr++; int bi=0;
+            while(*barr&&*barr!='"'&&bi<47) brands[nb][bi++]=*barr++;
+            brands[nb][bi]=0; if(bi>0) nb++;
+            if(*barr=='"') barr++;
+        }
+    }}
+
+    /* products */
+    const char *parr=strstr(json,"\"products\"");
+    if(parr){ parr=strchr(parr,'['); if(parr){ parr++;
+        np=0; int maxid=0;
+        mkdir(IMG_DIR,0755);
+        const char *end;
+        const char *obj=next_obj(parr,&end);
+        while(obj&&np<MAX_PRODS){
+            /* extract into temporary buffer */
+            size_t olen=end-obj;
+            char *blk=malloc(olen+1); if(!blk) break;
+            memcpy(blk,obj,olen); blk[olen]=0;
+
+            Prod *p=&prods[np];
+            memset(p,0,sizeof(Prod));
+            p->in_stock=1;
+
+            char tmp[64]={0};
+            jstr(blk,"id",   tmp,sizeof(tmp)); p->id=atoi(tmp);
+            jstr(blk,"name", p->name, sizeof(p->name));
+            jstr(blk,"desc", p->desc, sizeof(p->desc));
+            jstr(blk,"price",tmp,sizeof(tmp)); strncpy(p->price,tmp,19);
+            jstr(blk,"salePrice",p->sale_price,sizeof(p->sale_price));
+            jstr(blk,"size", p->size, sizeof(p->size));
+            jstr(blk,"icon", p->icon, sizeof(p->icon));
+            jstr(blk,"badge",p->badge,sizeof(p->badge));
+            jstr(blk,"brand",p->brand,sizeof(p->brand));
+            jstr(blk,"inStock",tmp,sizeof(tmp));
+            if(!strcmp(tmp,"false")||!strcmp(tmp,"0")) p->in_stock=0;
+
+            /* image — may be large base64 data-URL or a path */
+            char *imgval=jfield_big(blk,"image");
+            if(imgval&&imgval[0]){
+                if(strncmp(imgval,"data:",5)==0){
+                    /* decode base64 and save as file */
+                    const char *b64=strstr(imgval,"base64,");
+                    if(b64){ b64+=7;
+                        char imgpath[512];
+                        snprintf(imgpath,sizeof(imgpath),"%s/prod_%d.jpg",IMG_DIR,p->id);
+                        b64_to_file(b64,strlen(b64),imgpath);
+                        snprintf(p->image,sizeof(p->image),"images/prod_%d.jpg",p->id);
+                    }
+                } else {
+                    strncpy(p->image,imgval,255);
+                }
+            }
+            free(imgval); free(blk);
+
+            if(p->id>maxid) maxid=p->id;
+            np++;
+            obj=next_obj(end,&end);
+        }
+        nxtid=maxid+1;
+    }}
+
+    free(json);
+    if(sel>=np) sel=np>0?np-1:0;
+    if(np>0) p2f(sel); else img_free();
+    dirty=1; apply_filter();
+    char msg[80]; snprintf(msg,sizeof(msg),"Restored %d products, %d brands",np,nb);
+    set_st(msg);
+}
+
+/* ═══════════════════════════════════════════════════════════════
    Layout
    ═══════════════════════════════════════════════════════════════ */
 static void layout(void){
@@ -862,13 +1377,23 @@ static void layout(void){
     int bw=(LIST_W-PAD*2-8)/2;
     btn_add   =(SDL_Rect){PAD,     ry+(BAR_H-34)/2, bw,   34};
     btn_del   =(SDL_Rect){PAD+bw+8,ry+(BAR_H-34)/2, bw,   34};
-    btn_brands=(SDL_Rect){PAD,     ry-42,           LIST_W-PAD*2, 28};
+    btn_brands =(SDL_Rect){PAD,           ry-42,  LIST_W-PAD*2, 28};
+    int bw2=(LIST_W-PAD*2-4)/2;
+    btn_backup =(SDL_Rect){PAD,           ry-80,  bw2,          28};
+    btn_restore=(SDL_Rect){PAD+bw2+4,     ry-80,  bw2,          28};
 
     /* right panel bottom buttons */
-    int pw=138;
-    btn_wssync=(SDL_Rect){rx+PAD,              ry+(BAR_H-34)/2, pw,   34};
-    btn_save  =(SDL_Rect){WIN_W-PAD-pw*2-8,    ry+(BAR_H-34)/2, pw,   34};
-    btn_push  =(SDL_Rect){WIN_W-PAD-pw,         ry+(BAR_H-34)/2, pw,   34};
+    int pw=120;
+    btn_wssync  =(SDL_Rect){rx+PAD,            ry+(BAR_H-34)/2, pw,   34};
+    btn_history =(SDL_Rect){rx+PAD+pw+8,       ry+(BAR_H-34)/2, pw,   34};
+    btn_save    =(SDL_Rect){WIN_W-PAD-pw*2-8,  ry+(BAR_H-34)/2, pw,   34};
+    btn_push    =(SDL_Rect){WIN_W-PAD-pw,       ry+(BAR_H-34)/2, pw,   34};
+
+    /* search bar (left panel, between header and list) */
+    search_rect=(SDL_Rect){PAD, 46, LIST_W-PAD*2, 28};
+
+    /* history panel */
+    hist.rect=(SDL_Rect){rx+12, 50, WIN_W-rx-24, WIN_H-BAR_H-STAT_H-60};
 
     /* text fields */
     int fx=rx+PAD, fw=rw-PAD*2;
@@ -950,68 +1475,202 @@ static void render(void){
 
     /* ── LEFT PANEL ── */
     fr((SDL_Rect){0,0,LIST_W,bary},PANEL);
-    fr((SDL_Rect){0,0,LIST_W,42},CARD);
-    dt("Products",PAD,12,fLG,GOLD);
-    hl(0,LIST_W,42,BDR);
+    /* header gradient: deep card → panel */
+    frgrad((SDL_Rect){0,0,LIST_W,LIST_TOP}, C(22,18,32), C(14,12,22));
+    /* thin gold accent top bar */
+    frgrad((SDL_Rect){0,0,LIST_W,2}, LGOLD, GOLD);
+    dt("PRODUCTS",PAD,10,fSM,GOLD);
+    /* count badge */
+    char pcnt[24]; snprintf(pcnt,sizeof(pcnt),"%d",np);
+    {
+        int cw=0; SDL_Surface *cs=TTF_RenderUTF8_Blended(fSM,pcnt,GOLD); if(cs){cw=cs->w;SDL_FreeSurface(cs);}
+        SDL_Rect badge={LIST_W-PAD-cw-6, 8, cw+6, 14};
+        frgrad(badge,C(38,28,8),C(28,18,4)); dr(badge,DGOLD);
+        dt(pcnt,badge.x+3,badge.y+1,fSM,LGOLD);
+    }
 
-    /* product list — scrollable */
-    int vis_items=(bary-42)/ITEM_H;
-    int max_scroll=np-vis_items; if(max_scroll<0) max_scroll=0;
+    /* search bar */
+    {
+        SDL_Color sbg=search_active?C(28,22,6):C(18,16,26);
+        SDL_Color sbdr=search_active?GOLD:BDR;
+        frgrad(search_rect,C(sbg.r+6,sbg.g+5,sbg.b+8),sbg);
+        dr(search_rect,sbdr);
+        if(search_active) glow(search_rect,GOLD,2);
+        if(search_buf[0]){
+            SDL_Rect sc2={search_rect.x+20,search_rect.y,search_rect.w-32,search_rect.h};
+            dtclip(search_buf,sc2,fSM,TEXT);
+            if(search_active){
+                int cw=0;
+                SDL_Surface *ss=TTF_RenderUTF8_Blended(fSM,search_buf,TEXT);
+                if(ss){cw=ss->w;SDL_FreeSurface(ss);}
+                int cx=search_rect.x+20+cw;
+                SDL_SetRenderDrawBlendMode(gren,SDL_BLENDMODE_BLEND);
+                SDL_SetRenderDrawColor(gren,GOLD.r,GOLD.g,GOLD.b,200);
+                SDL_RenderDrawLine(gren,cx,search_rect.y+5,cx,search_rect.y+search_rect.h-5);
+                SDL_SetRenderDrawBlendMode(gren,SDL_BLENDMODE_NONE);
+            }
+        } else {
+            dt("🔍",search_rect.x+4,search_rect.y+6,fSM,MUTED);
+            dt("Search...",search_rect.x+20,search_rect.y+7,fSM,MUTED);
+        }
+        if(search_buf[0]){
+            SDL_Rect clx={search_rect.x+search_rect.w-18,search_rect.y+7,12,14};
+            dtctr("×",clx,fSM,MUTED);
+        }
+    }
+    /* header bottom line — subtle gold */
+    SDL_SetRenderDrawBlendMode(gren,SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(gren,GOLD.r,GOLD.g,GOLD.b,60);
+    SDL_RenderDrawLine(gren,0,LIST_TOP,LIST_W,LIST_TOP);
+    SDL_SetRenderDrawBlendMode(gren,SDL_BLENDMODE_NONE);
+
+    /* product list — filtered, stops 90px above bar */
+    int list_bot=bary-90;
+    int vis_items=(list_bot-LIST_TOP)/ITEM_H;
+    int max_scroll=nf-vis_items; if(max_scroll<0) max_scroll=0;
     if(list_scroll>max_scroll) list_scroll=max_scroll;
 
-    SDL_RenderSetClipRect(gren,&(SDL_Rect){0,42,LIST_W,bary-42});
-    for(int i=0;i<np;i++){
-        int iy=42+(i-list_scroll)*ITEM_H;
-        if(iy+ITEM_H<42||iy>bary) continue;
+    SDL_RenderSetClipRect(gren,&(SDL_Rect){0,LIST_TOP,LIST_W,list_bot-LIST_TOP});
+    for(int fi=0;fi<nf;fi++){
+        int pi=filt[fi];
+        int iy=LIST_TOP+(fi-list_scroll)*ITEM_H;
+        if(iy+ITEM_H<LIST_TOP||iy>list_bot) continue;
+
+        /* drag insertion line */
+        if(drag.active&&fi==drag.to_fi&&fi!=drag.from_fi){
+            SDL_SetRenderDrawBlendMode(gren,SDL_BLENDMODE_BLEND);
+            SDL_SetRenderDrawColor(gren,GOLD.r,GOLD.g,GOLD.b,200);
+            SDL_RenderFillRect(gren,&(SDL_Rect){0,iy,LIST_W,2});
+            SDL_SetRenderDrawBlendMode(gren,SDL_BLENDMODE_NONE);
+        }
+        if(drag.active&&fi==drag.from_fi) continue;
+
         SDL_Rect ir={0,iy,LIST_W,ITEM_H};
-        SDL_Color bg=(i==sel)?SELB:(i==hov_item)?HOVB:PANEL;
-        fr(ir,bg); hl(0,LIST_W,iy+ITEM_H-1,BDR);
-        if(i==sel) fr((SDL_Rect){0,iy,3,ITEM_H},GOLD);
-        SDL_Rect nc={PAD+4,iy+8,LIST_W-PAD*2,18};
-        dtclip(prods[i].name[0]?prods[i].name:"(unnamed)",nc,fMD,(i==sel)?LGOLD:TEXT);
-        char pt[32]; snprintf(pt,sizeof(pt),"$%s / %s",prods[i].price,prods[i].size);
-        SDL_Rect pc={PAD+4,iy+28,LIST_W-PAD*2,14}; dtclip(pt,pc,fSM,MUTED);
+        int is_sel=(pi==sel), is_hov=(pi==hov_item);
+        if(is_sel){
+            frgrad(ir, C(40,28,6), C(26,18,3));
+        } else if(is_hov){
+            frgrad(ir, C(24,20,5), C(18,14,3));
+        } else {
+            fr(ir,PANEL);
+        }
+        /* separator */
+        SDL_SetRenderDrawBlendMode(gren,SDL_BLENDMODE_BLEND);
+        SDL_SetRenderDrawColor(gren,BDR.r,BDR.g,BDR.b,100);
+        SDL_RenderDrawLine(gren,PAD,iy+ITEM_H-1,LIST_W-PAD,iy+ITEM_H-1);
+        SDL_SetRenderDrawBlendMode(gren,SDL_BLENDMODE_NONE);
+        /* gold left accent bar with glow when selected */
+        if(is_sel){
+            frgrad((SDL_Rect){0,iy,4,ITEM_H},LGOLD,GOLD);
+            SDL_SetRenderDrawBlendMode(gren,SDL_BLENDMODE_BLEND);
+            for(int g=3;g>0;g--){
+                SDL_SetRenderDrawColor(gren,GOLD.r,GOLD.g,GOLD.b,(Uint8)(40/g));
+                SDL_RenderDrawLine(gren,g,iy,g,iy+ITEM_H-1);
+            }
+            SDL_SetRenderDrawBlendMode(gren,SDL_BLENDMODE_NONE);
+        }
+        /* drag handle */
+        SDL_SetRenderDrawBlendMode(gren,SDL_BLENDMODE_BLEND);
+        SDL_SetRenderDrawColor(gren,80,72,100,120);
+        for(int d=0;d<3;d++){
+            SDL_RenderDrawPoint(gren,6,iy+12+d*6);
+            SDL_RenderDrawPoint(gren,9,iy+12+d*6);
+        }
+        SDL_SetRenderDrawBlendMode(gren,SDL_BLENDMODE_NONE);
+        /* name */
+        SDL_Rect nc={PAD+10,iy+7,LIST_W-PAD*2-14,18};
+        dtclip(prods[pi].name[0]?prods[pi].name:"(unnamed)",nc,fMD,is_sel?LGOLD:TEXT);
+        /* price */
+        char pt[32]; snprintf(pt,sizeof(pt),"$%s · %s",prods[pi].price,prods[pi].size);
+        SDL_Rect pc={PAD+10,iy+27,LIST_W-PAD*2-14,14}; dtclip(pt,pc,fSM,is_sel?C(180,150,70):MUTED);
+        /* out-of-stock dot */
+        if(!prods[pi].in_stock){
+            SDL_SetRenderDrawBlendMode(gren,SDL_BLENDMODE_BLEND);
+            SDL_SetRenderDrawColor(gren,RED.r,RED.g,RED.b,200);
+            SDL_RenderFillRect(gren,&(SDL_Rect){LIST_W-16,iy+19,6,6});
+            SDL_SetRenderDrawBlendMode(gren,SDL_BLENDMODE_NONE);
+        }
+    }
+    /* drag ghost */
+    if(drag.active&&drag.from_fi>=0&&drag.from_fi<nf){
+        int pi=filt[drag.from_fi];
+        int gy=drag.cur_y-ITEM_H/2;
+        SDL_Rect gr={0,gy,LIST_W,ITEM_H};
+        SDL_SetRenderDrawBlendMode(gren,SDL_BLENDMODE_BLEND);
+        SDL_SetRenderDrawColor(gren,40,30,8,200); SDL_RenderFillRect(gren,&gr);
+        SDL_SetRenderDrawColor(gren,GOLD.r,GOLD.g,GOLD.b,160); SDL_RenderDrawRect(gren,&gr);
+        SDL_SetRenderDrawBlendMode(gren,SDL_BLENDMODE_NONE);
+        SDL_Rect nc={PAD+10,gy+7,LIST_W-PAD*2,18};
+        dtclip(prods[pi].name[0]?prods[pi].name:"(unnamed)",nc,fMD,LGOLD);
     }
     SDL_RenderSetClipRect(gren,NULL);
 
-    /* scrollbar for product list */
-    if(np>vis_items){
-        int sbh=bary-42, sby=42;
-        int th=sbh*vis_items/np;
-        int ty=sby+(list_scroll*(sbh-th))/(np-vis_items);
-        fr((SDL_Rect){LIST_W-5,sby,4,sbh},CARD);
-        fr((SDL_Rect){LIST_W-5,ty,4,th},MUTED);
+    /* scrollbar — thin gold-tinted */
+    if(nf>vis_items){
+        int sbh=list_bot-LIST_TOP, sby=LIST_TOP;
+        int th=sbh*vis_items/nf; if(th<12)th=12;
+        int ty=sby+(list_scroll*(sbh-th))/(nf-vis_items>0?nf-vis_items:1);
+        SDL_SetRenderDrawBlendMode(gren,SDL_BLENDMODE_BLEND);
+        SDL_SetRenderDrawColor(gren,BDR.r,BDR.g,BDR.b,60);
+        SDL_RenderFillRect(gren,&(SDL_Rect){LIST_W-4,sby,3,sbh});
+        SDL_SetRenderDrawBlendMode(gren,SDL_BLENDMODE_NONE);
+        frgrad((SDL_Rect){LIST_W-4,ty,3,th},LGOLD,GOLD);
     }
+
+    /* cover partial items + button area gradient */
+    frgrad((SDL_Rect){0,list_bot,LIST_W,bary-list_bot},C(16,13,24),C(13,11,20));
+    SDL_SetRenderDrawBlendMode(gren,SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(gren,GOLD.r,GOLD.g,GOLD.b,40);
+    SDL_RenderDrawLine(gren,0,list_bot,LIST_W,list_bot);
+    SDL_SetRenderDrawBlendMode(gren,SDL_BLENDMODE_NONE);
 
     /* left bar */
-    fr((SDL_Rect){0,bary,LIST_W,BAR_H},PANEL);
-    hl(0,LIST_W,bary,BDR);
-    btn(btn_add,"+ Add",   C(18,38,14),GRN);
-    btn(btn_del,"Delete",  C(38,14,14),RED);
+    frgrad((SDL_Rect){0,bary,LIST_W,BAR_H},C(18,15,28),C(12,10,20));
+    SDL_SetRenderDrawBlendMode(gren,SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(gren,GOLD.r,GOLD.g,GOLD.b,50);
+    SDL_RenderDrawLine(gren,0,bary,LIST_W,bary);
+    SDL_SetRenderDrawBlendMode(gren,SDL_BLENDMODE_NONE);
+    btn(btn_add,"+ Add",   C(14,36,12),GRN);
+    btn(btn_del,"Delete",  C(42,12,12),RED);
 
-    /* ── DIVIDER ── */
-    fr((SDL_Rect){LIST_W,0,1,WIN_H},BDR);
+    /* ── DIVIDER — subtle vertical gold line ── */
+    frgrad((SDL_Rect){LIST_W,0,1,WIN_H},DGOLD,C(20,15,6));
 
     /* ── RIGHT PANEL HEADER ── */
-    fr((SDL_Rect){rx,0,WIN_W-rx,42},CARD);
-    hl(rx,WIN_W,42,BDR);
+    frgrad((SDL_Rect){rx,0,WIN_W-rx,46},C(22,18,34),C(14,12,24));
+    frgrad((SDL_Rect){rx,0,WIN_W-rx,2},LGOLD,GOLD);
+    SDL_SetRenderDrawBlendMode(gren,SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(gren,GOLD.r,GOLD.g,GOLD.b,50);
+    SDL_RenderDrawLine(gren,rx,46,WIN_W,46);
+    SDL_SetRenderDrawBlendMode(gren,SDL_BLENDMODE_NONE);
 
     if(np==0){
-        char htitle[64]="Editing: —";
-        dt(htitle,rx+PAD,12,fLG,MUTED);
+        dt("— No Products —",rx+PAD,13,fLG,MUTED);
     } else {
-        char htitle[80]; snprintf(htitle,sizeof(htitle),"Editing: %s",
+        char htitle[80]; snprintf(htitle,sizeof(htitle),"%s",
             prods[sel].name[0]?prods[sel].name:"(new)");
-        dt(htitle,rx+PAD,12,fLG,TEXT);
+        dt(htitle,rx+PAD,13,fLG,LGOLD);
     }
 
-    /* WS status (top-right) */
-    SDL_Color dc = ws_state==WS_READY?GRN : ws_state==WS_CONN?C(200,160,30):RED;
-    fr((SDL_Rect){WIN_W-136,16,10,10},dc);
-    const char *wsl = ws_state==WS_READY?"Live" : ws_state==WS_CONN?"Connecting...":"Offline";
-    dt(wsl,WIN_W-122,12,fSM,dc);
-    char oc[32]; snprintf(oc,sizeof(oc),"Orders: %d",ws_orders);
-    dt(oc,WIN_W-122,24,fSM,MUTED);
+    /* WS live indicator — pulsing dot */
+    {
+        SDL_Color dc = ws_state==WS_READY?GRN : ws_state==WS_CONN?C(200,165,30):RED;
+        /* pulse: slightly vary brightness using ticks */
+        if(ws_state==WS_READY){
+            Uint32 t=SDL_GetTicks();
+            float pulse=0.7f+0.3f*(float)(SDL_sin((double)t/600.0)*0.5+0.5);
+            dc.r=(Uint8)(dc.r*pulse); dc.g=(Uint8)(dc.g*pulse); dc.b=(Uint8)(dc.b*pulse);
+        }
+        SDL_SetRenderDrawBlendMode(gren,SDL_BLENDMODE_BLEND);
+        SDL_SetRenderDrawColor(gren,dc.r,dc.g,dc.b,60);
+        SDL_RenderFillRect(gren,&(SDL_Rect){WIN_W-138,12,14,14});
+        SDL_SetRenderDrawBlendMode(gren,SDL_BLENDMODE_NONE);
+        fr((SDL_Rect){WIN_W-135,15,8,8},dc);
+        const char *wsl=ws_state==WS_READY?"Live":ws_state==WS_CONN?"Connecting…":"Offline";
+        dt(wsl,WIN_W-122,12,fSM,dc);
+        char oc[32]; snprintf(oc,sizeof(oc),"Orders: %d",ws_orders);
+        dt(oc,WIN_W-122,24,fSM,MUTED);
+    }
 
     /* ── EDIT FORM ── */
     if(np>0){
@@ -1052,20 +1711,38 @@ static void render(void){
     }
 
     /* ── BOTTOM BAR ── */
-    fr((SDL_Rect){rx,bary,WIN_W-rx,BAR_H},CARD);
-    hl(rx,WIN_W,bary,BDR);
+    frgrad((SDL_Rect){rx,bary,WIN_W-rx,BAR_H},C(18,15,28),C(10,9,18));
+    /* top gold accent line */
+    SDL_SetRenderDrawBlendMode(gren,SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(gren,GOLD.r,GOLD.g,GOLD.b,55);
+    SDL_RenderDrawLine(gren,rx,bary,WIN_W,bary);
+    SDL_SetRenderDrawBlendMode(gren,SDL_BLENDMODE_NONE);
 
-    SDL_Color wbc=ws_state==WS_READY?C(18,45,65):C(28,28,28);
-    SDL_Color wfc=ws_state==WS_READY?TEXT:MUTED;
+    SDL_Color wbc=ws_state==WS_READY?C(12,38,58):C(22,20,34);
+    SDL_Color wfc=ws_state==WS_READY?C(120,210,255):MUTED;
     btn(btn_wssync,"Sync Live",wbc,wfc);
-    btn(btn_save,  "Save HTML",GRN,C(8,8,8));
-    btn(btn_push,  "Push GitHub",C(20,40,20),GRN);
-    if(dirty) dt("*",btn_save.x-14,btn_save.y+10,fMD,GOLD);
+    if(ws_state==WS_READY) glow(btn_wssync,C(60,160,220),3);
+    btn(btn_history,"History",C(22,20,38),hist.open?LGOLD:MUTED);
+    if(hist.open) glow(btn_history,GOLD,2);
+    btn(btn_save,  "Save HTML",C(10,40,16),GRN);
+    btn(btn_push,  "Push GitHub",C(10,32,10),C(80,220,80));
+    if(dirty){
+        glow(btn_save,GOLD,3);
+        dr(btn_save,GOLD);
+        SDL_SetRenderDrawBlendMode(gren,SDL_BLENDMODE_BLEND);
+        SDL_SetRenderDrawColor(gren,GOLD.r,GOLD.g,GOLD.b,200);
+        SDL_RenderDrawPoint(gren,btn_save.x-10,btn_save.y+btn_save.h/2);
+        SDL_SetRenderDrawBlendMode(gren,SDL_BLENDMODE_NONE);
+        dt("●",btn_save.x-14,btn_save.y+9,fSM,GOLD);
+    }
 
     /* ── STATUS BAR ── */
     int sy=WIN_H-STAT_H;
-    fr((SDL_Rect){0,sy,WIN_W,STAT_H},C(10,10,10));
-    hl(0,WIN_W,sy,BDR);
+    frgrad((SDL_Rect){0,sy,WIN_W,STAT_H},C(10,9,16),C(7,6,12));
+    SDL_SetRenderDrawBlendMode(gren,SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(gren,GOLD.r,GOLD.g,GOLD.b,30);
+    SDL_RenderDrawLine(gren,0,sy,WIN_W,sy);
+    SDL_SetRenderDrawBlendMode(gren,SDL_BLENDMODE_NONE);
     dt(stmsg,PAD,sy+7,fSM,MUTED);
 
     /* ── ORDER NOTIFICATION ── */
@@ -1100,8 +1777,15 @@ static void render(void){
     /* ── BRANDS BUTTON (above left bar) ── */
     SDL_Color bbc = bp.open ? GOLD : CARD;
     SDL_Color bfc = bp.open ? BG   : MUTED;
-    fr(btn_brands,bbc); dr(btn_brands,bp.open?GOLD:BDR);
-    dtctr("Manage Brands",btn_brands,fSM,bfc);
+    frgrad(btn_brands,bp.open?C(38,28,6):C(20,17,32),bp.open?C(26,18,4):C(14,12,24));
+    dr(btn_brands,bp.open?GOLD:BDR);
+    if(bp.open) glow(btn_brands,GOLD,2);
+    shine(btn_brands);
+    dtctr("✦ Manage Brands",btn_brands,fSM,bp.open?LGOLD:MUTED);
+
+    /* ── BACKUP / RESTORE BUTTONS ── */
+    btn(btn_backup, "Backup", C(10,28,10),GRN);
+    btn(btn_restore,"Restore",C(30,15,5), GOLD);
 
     /* ── FILE BROWSER ── */
     if(fb.open) fb_draw();
@@ -1131,8 +1815,12 @@ static void render(void){
             SDL_Rect row={listR.x,iy,listR.w,32};
             fr(row,i==bp.hov?HOVB:PANEL);
             hl(listR.x,listR.x+listR.w,iy+31,BDR);
-            SDL_Rect bnc={listR.x+PAD,iy,listR.w-48,32}; dtclip(brands[i],bnc,fMD,TEXT);
+            SDL_Rect bnc={listR.x+PAD,iy,listR.w-96,32}; dtclip(brands[i],bnc,fMD,TEXT);
+            SDL_Rect up ={r.x+r.w-90,iy+6,22,20};
+            SDL_Rect dn ={r.x+r.w-64,iy+6,22,20};
             SDL_Rect del={r.x+r.w-38,iy+6,22,20};
+            fr(up, i>0    ?C(28,40,60):C(18,18,24)); dtctr("^",up, fSM,i>0    ?BLUE:MUTED);
+            fr(dn, i<nb-1 ?C(28,40,60):C(18,18,24)); dtctr("v",dn, fSM,i<nb-1 ?BLUE:MUTED);
             fr(del,C(50,18,18)); dtctr("x",del,fSM,RED);
         }
         SDL_RenderSetClipRect(gren,NULL);
@@ -1148,6 +1836,9 @@ static void render(void){
         SDL_Rect addb={r.x+r.w-74,iny,62,32};
         fr(addb,GRN); dtctr("Add",addb,fMD,BG);
     }
+
+    /* ── HISTORY PANEL ── */
+    if(hist.open) hist_draw();
 
     SDL_RenderPresent(gren);
 }
@@ -1194,7 +1885,21 @@ static void handle(SDL_Event *e){
             if(pin(listR,mx,my)){
                 int idx=(my-listR.y)/32;
                 if(idx>=0&&idx<nb){
+                    SDL_Rect up ={r.x+r.w-90,r.y+40+idx*32+6,22,20};
+                    SDL_Rect dn ={r.x+r.w-64,r.y+40+idx*32+6,22,20};
                     SDL_Rect del={r.x+r.w-38,r.y+40+idx*32+6,22,20};
+                    if(pin(up,mx,my)&&idx>0){
+                        char tmp[48]; memcpy(tmp,brands[idx],48);
+                        memcpy(brands[idx],brands[idx-1],48);
+                        memcpy(brands[idx-1],tmp,48);
+                        dirty=1; return;
+                    }
+                    if(pin(dn,mx,my)&&idx<nb-1){
+                        char tmp[48]; memcpy(tmp,brands[idx],48);
+                        memcpy(brands[idx],brands[idx+1],48);
+                        memcpy(brands[idx+1],tmp,48);
+                        dirty=1; return;
+                    }
                     if(pin(del,mx,my)){
                         memmove(&brands[idx],&brands[idx+1],(nb-idx-1)*sizeof(brands[0]));
                         nb--; dirty=1; return;
@@ -1294,21 +1999,80 @@ static void handle(SDL_Event *e){
         return;
     }
 
+    /* ── history panel ── */
+    if(hist.open){
+        if(e->type==SDL_MOUSEWHEEL){
+            hist.scroll-=e->wheel.y;
+            if(hist.scroll<0) hist.scroll=0;
+            return;
+        }
+        if(e->type==SDL_MOUSEBUTTONDOWN&&e->button.button==SDL_BUTTON_LEFT){
+            int mx=e->button.x,my=e->button.y;
+            SDL_Rect xb={hist.rect.x+hist.rect.w-32,hist.rect.y+6,26,26};
+            if(!pin(hist.rect,mx,my)||pin(xb,mx,my)){ hist.open=0; return; }
+            return;
+        }
+        if(e->type==SDL_KEYDOWN&&e->key.keysym.sym==SDLK_ESCAPE){ hist.open=0; return; }
+        return;
+    }
+
     /* ── mouse wheel: scroll product list ── */
     if(e->type==SDL_MOUSEWHEEL&&e->wheel.x==0){
-        if(e->motion.x<LIST_W||!e->motion.x){
+        int mx2=0,my2=0; SDL_GetMouseState(&mx2,&my2);
+        if(mx2<LIST_W){
             list_scroll-=e->wheel.y;
             if(list_scroll<0) list_scroll=0;
         }
         return;
     }
 
-    /* ── mouse motion ── */
+    /* ── mouse motion / drag ── */
     if(e->type==SDL_MOUSEMOTION){
         int mx=e->motion.x,my=e->motion.y; hov_item=-1;
-        for(int i=0;i<np;i++){
-            SDL_Rect ir={0,42+(i-list_scroll)*ITEM_H,LIST_W,ITEM_H};
-            if(pin(ir,mx,my)){ hov_item=i; break; }
+        /* update drag */
+        if(drag.held){
+            if(!drag.active&&abs(my-drag.start_y)>8){
+                drag.active=1;
+            }
+            if(drag.active){
+                drag.cur_y=my;
+                /* compute target position */
+                int fi=(my-LIST_TOP)/ITEM_H+list_scroll;
+                if(fi<0) fi=0; if(fi>=nf) fi=nf-1;
+                drag.to_fi=fi;
+            }
+        }
+        /* hover */
+        for(int fi=0;fi<nf;fi++){
+            SDL_Rect ir={0,LIST_TOP+(fi-list_scroll)*ITEM_H,LIST_W,ITEM_H};
+            if(pin(ir,mx,my)){ hov_item=filt[fi]; break; }
+        }
+        return;
+    }
+
+    /* ── mouse button up (end drag) ── */
+    if(e->type==SDL_MOUSEBUTTONUP&&e->button.button==SDL_BUTTON_LEFT){
+        if(drag.held){
+            if(drag.active&&drag.from_fi!=drag.to_fi&&nf>1){
+                /* only reorder when no search filter (1:1 mapping to prods[]) */
+                if(nf==np){
+                    int from=drag.from_fi, to=drag.to_fi;
+                    Prod tmp=prods[filt[from]];
+                    if(from<to){
+                        memmove(&prods[from],&prods[from+1],(to-from)*sizeof(Prod));
+                    } else {
+                        memmove(&prods[to+1],&prods[to],(from-to)*sizeof(Prod));
+                    }
+                    prods[to]=tmp;
+                    /* keep sel pointing at same product */
+                    if(sel==filt[from]) sel=to;
+                    else if(sel>=to&&sel<from) sel++;
+                    else if(sel>from&&sel<=to) sel--;
+                    dirty=1;
+                    apply_filter();
+                }
+            }
+            drag.held=0; drag.active=0;
         }
         return;
     }
@@ -1326,11 +2090,36 @@ static void handle(SDL_Event *e){
         }
         pthread_mutex_unlock(&notif_mtx);
 
-        /* product list */
-        for(int i=0;i<np;i++){
-            SDL_Rect ir={0,42+(i-list_scroll)*ITEM_H,LIST_W,ITEM_H};
-            if(pin(ir,mx,my)){
-                f2p(sel); sel=i; p2f(sel); tf_off(); return;
+        /* ── left panel overlay buttons (checked BEFORE list so they aren't blocked) ── */
+        if(pin(btn_backup, mx,my)){ f2p(sel); do_backup();  return; }
+        if(pin(btn_restore,mx,my)){ do_restore(); return; }
+        if(pin(btn_brands, mx,my)){ bp.open=!bp.open; SDL_StartTextInput(); return; }
+
+        /* search bar click */
+        if(pin(search_rect,mx,my)){
+            /* clear X button */
+            if(search_buf[0]){
+                SDL_Rect clx={search_rect.x+search_rect.w-20,search_rect.y+6,14,16};
+                if(pin(clx,mx,my)){ search_buf[0]=0; search_len=0; apply_filter(); return; }
+            }
+            search_active=1; tf_off(); SDL_StartTextInput(); return;
+        }
+        search_active=0;
+
+        /* product list (filtered) — exclude the overlay button area at bottom */
+        int bary=WIN_H-BAR_H-STAT_H;
+        SDL_Rect lzone={0,LIST_TOP,LIST_W,bary-LIST_TOP-90};
+        if(pin(lzone,mx,my)){
+            for(int fi=0;fi<nf;fi++){
+                SDL_Rect ir={0,LIST_TOP+(fi-list_scroll)*ITEM_H,LIST_W,ITEM_H};
+                if(pin(ir,mx,my)){
+                    f2p(sel); sel=filt[fi]; p2f(sel); tf_off();
+                    /* start drag tracking */
+                    drag.held=1; drag.active=0;
+                    drag.from_fi=fi; drag.to_fi=fi;
+                    drag.start_y=my; drag.cur_y=my;
+                    return;
+                }
             }
         }
 
@@ -1341,14 +2130,14 @@ static void handle(SDL_Event *e){
             p->id=nxtid++; strcpy(p->name,"New Perfume");
             strcpy(p->price,"0"); strcpy(p->size,"100ml"); strcpy(p->icon,"🌹");
             p->in_stock=1;
-            sel=np++; p2f(sel); dirty=1; return;
+            sel=np++; p2f(sel); dirty=1; apply_filter(); return;
         }
         /* delete */
         if(pin(btn_del,mx,my)&&np>0){
             f2p(sel);
             memmove(&prods[sel],&prods[sel+1],(np-sel-1)*sizeof(Prod));
             np--; if(sel>=np&&sel>0) sel--;
-            if(np>0) p2f(sel); else img_free(); dirty=1; return;
+            if(np>0) p2f(sel); else img_free(); dirty=1; apply_filter(); return;
         }
         /* text fields */
         for(int i=0;i<NF;i++){
@@ -1362,9 +2151,9 @@ static void handle(SDL_Event *e){
         if(pin(btn_browse,mx,my)){ f2p(sel); tf_off(); fb_open_browser(); return; }
         /* paste */
         if(pin(btn_paste,mx,my)){ f2p(sel); tf_off(); paste_clip(); return; }
-        /* WS sync */
-        if(pin(btn_brands,mx,my)){ bp.open=!bp.open; SDL_StartTextInput(); return; }
-        if(pin(btn_wssync,mx,my)){ f2p(sel); ws_send_products(); return; }
+        if(pin(btn_wssync, mx,my)){ f2p(sel); ws_send_products(); return; }
+        /* history */
+        if(pin(btn_history,mx,my)){ hist.open=!hist.open; if(hist.open) load_hist(); return; }
         /* save */
         if(pin(btn_save,mx,my)){ f2p(sel); html_save(); return; }
         /* push */
@@ -1375,8 +2164,25 @@ static void handle(SDL_Event *e){
 
     /* ── key ── */
     if(e->type==SDL_KEYDOWN){
-        if(atf<0) return;
         SDL_Keycode k=e->key.keysym.sym;
+
+        /* search active: handle input */
+        if(search_active){
+            if(k==SDLK_ESCAPE||k==SDLK_RETURN){ search_active=0; SDL_StopTextInput(); return; }
+            if(k==SDLK_BACKSPACE){
+                if(search_len>0){
+                    /* handle multi-byte UTF-8 backspace */
+                    while(search_len>0&&(search_buf[search_len-1]&0xC0)==0x80) search_len--;
+                    if(search_len>0) search_len--;
+                    search_buf[search_len]=0; apply_filter();
+                }
+                return;
+            }
+            return;
+        }
+
+        if(k==SDLK_ESCAPE&&hist.open){ hist.open=0; return; }
+        if(atf<0) return;
         TF *t=&tfs[atf];
         if(k==SDLK_BACKSPACE){ tf_bs(t); f2p(sel); }
         else if(k==SDLK_LEFT&&t->cur>0)    t->cur--;
@@ -1391,8 +2197,18 @@ static void handle(SDL_Event *e){
     }
 
     /* ── text input ── */
-    if(e->type==SDL_TEXTINPUT&&atf>=0){
-        tf_ins(&tfs[atf],e->text.text); f2p(sel); return;
+    if(e->type==SDL_TEXTINPUT){
+        if(search_active){
+            int sl=strlen(e->text.text);
+            if(search_len+sl<(int)sizeof(search_buf)-1){
+                memcpy(search_buf+search_len,e->text.text,sl);
+                search_len+=sl; search_buf[search_len]=0;
+                apply_filter();
+            }
+            return;
+        }
+        if(atf>=0){ tf_ins(&tfs[atf],e->text.text); f2p(sel); }
+        return;
     }
 }
 
@@ -1406,7 +2222,7 @@ static void ws_poll(void){
             case WEV_CONNECTED:    set_st("WebSocket connected — authenticating..."); break;
             case WEV_DISCONNECTED: set_st("WebSocket offline — reconnecting in 5s..."); break;
             case WEV_SYNCED:       set_st("Live! Products synced to website."); break;
-            case WEV_ORDER:        set_st("New order received!"); break;
+            case WEV_ORDER:        save_order(); set_st("New order received!"); break;
         }
     }
 }
@@ -1454,6 +2270,9 @@ int main(void){
     pthread_t wt;
     pthread_create(&wt,NULL,ws_thread,NULL);
     pthread_detach(wt);
+
+    /* ── pull latest from GitHub before loading ── */
+    system("cd /home/xmm/Projects/perfume-store && git fetch origin && git checkout origin/main -- index.html 2>/dev/null");
 
     /* ── layout + load ── */
     layout();
