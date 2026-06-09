@@ -137,6 +137,7 @@ static int        wsq_head = 0, wsq_tail = 0;
 static pthread_mutex_t wsq_mtx = PTHREAD_MUTEX_INITIALIZER;
 static struct lws_context *ws_ctx = NULL;
 static struct lws         *ws_wsi = NULL;
+static int                 ws_authed = 0;
 
 static void wsq_push(const char *json) {
     pthread_mutex_lock(&wsq_mtx);
@@ -367,23 +368,23 @@ static int ws_cb(struct lws *wsi, enum lws_callback_reasons reason,
     switch(reason){
 
     case LWS_CALLBACK_CLIENT_ESTABLISHED:
-        ws_wsi   = wsi;
-        ws_state = WS_CONN;
+        ws_wsi    = wsi;
+        ws_state  = WS_CONN;
+        ws_authed = 0;
         wev_push(WEV_CONNECTED, NULL);
         lws_callback_on_writable(wsi);
         break;
 
     case LWS_CALLBACK_CLIENT_WRITEABLE: {
         /* send auth first, then any queued messages */
-        static int authed = 0;
         char msg[8192+LWS_PRE];
         int  mlen = 0;
 
         pthread_mutex_lock(&wsq_mtx);
-        if(!authed){
+        if(!ws_authed){
             mlen = snprintf(msg+LWS_PRE, sizeof(msg)-LWS_PRE,
                 "{\"type\":\"admin_auth\",\"secret\":\"%s\"}", WS_SECRET);
-            authed = 1;
+            ws_authed = 1;
         } else if(wsq_head != wsq_tail){
             mlen = (int)strlen(wsq_buf[wsq_head]);
             memcpy(msg+LWS_PRE, wsq_buf[wsq_head], mlen);
@@ -458,7 +459,6 @@ static struct lws_protocols ws_protos[] = {
 static void *ws_thread(void *arg){
     (void)arg;
     Uint32 last_try = 0;
-    static int authed_flag = 0;   /* reset on each reconnect */
 
     while(ws_running){
         if(ws_ctx) lws_service(ws_ctx, 50);
@@ -467,7 +467,6 @@ static void *ws_thread(void *arg){
         Uint32 now = SDL_GetTicks();
         if(ws_state==WS_OFF && now-last_try > 5000){
             last_try = now;
-            authed_flag = 0;
 
             struct lws_client_connect_info cc; memset(&cc,0,sizeof(cc));
             cc.context     = ws_ctx;
@@ -785,15 +784,17 @@ static void html_save(void){
         bp2+=snprintf(brnjs+bp2,2047,"let brands = [\n");
         for(int i=0;i<nb;i++)
             bp2+=snprintf(brnjs+bp2,2047-bp2,"    \"%s\"%s\n",brands[i],i<nb-1?",":"");
-        bp2+=snprintf(brnjs+bp2,2047-bp2,"  ]");
+        bp2+=snprintf(brnjs+bp2,2047-bp2,"  ];");
 
         int pre=(int)(brands_start-buf);
-        int after_end=(int)strlen(brands_end+strlen("\n  ];")); /* rest after brands ] */
+        /* skip past ]; in original, handling any extra semicolons */
+        const char *after_brnds = brands_end + strlen("\n  ]");
+        while(*after_brnds == ';') after_brnds++;
         /* reconstruct buf with new brands */
         char *tmp2=malloc(BUF_MAX*2);
         memcpy(tmp2,buf,pre);
         memcpy(tmp2+pre,brnjs,bp2);
-        strcpy(tmp2+pre+bp2,brands_end+strlen("\n  ];")-1);
+        strcpy(tmp2+pre+bp2, after_brnds);
         /* update buf pointer (re-read needed) */
         sz=(int)strlen(tmp2); tmp2[sz]=0;
         free(buf); buf=tmp2; free(brnjs);
