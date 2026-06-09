@@ -181,6 +181,7 @@ static int  list_scroll = 0;
 enum { FN=0, FD, FP, FSP, FS, FB_F, FB_BRAND, NF };
 static TF   tfs[NF];
 static int  atf = -1;
+static int  brand_dd = 0;
 
 static SDL_Texture *imgtex = NULL;
 static int imgw = 0, imgh = 0;
@@ -503,21 +504,25 @@ static void ws_send_products(void){
         "{\"type\":\"update_products\",\"secret\":\"%s\",\"products\":[", WS_SECRET);
     for(int i=0;i<np&&pos<(int)sizeof(json)-512;i++){
         Prod *p=&prods[i];
-        char bj[48],ij[280],spj[40];
+        char bj[48],ij[280],spj[40],brj[80];
         if(p->badge[0])      snprintf(bj, sizeof(bj), "\"%s\"",p->badge); else strcpy(bj,"null");
         if(p->image[0])      snprintf(ij, sizeof(ij), "\"%s\"",p->image); else strcpy(ij,"null");
         if(p->sale_price[0]) snprintf(spj,sizeof(spj),"%s",    p->sale_price); else strcpy(spj,"null");
+        if(p->brand[0])      snprintf(brj,sizeof(brj),"\"%s\"",p->brand); else strcpy(brj,"null");
         pos += snprintf(json+pos, sizeof(json)-pos,
             "{\"id\":%d,\"name\":\"%s\",\"desc\":\"%s\","
             "\"price\":%s,\"size\":\"%s\",\"icon\":\"%s\","
-            "\"badge\":%s,\"image\":%s,\"inStock\":%s,\"salePrice\":%s}%s",
+            "\"badge\":%s,\"image\":%s,\"brand\":%s,\"inStock\":%s,\"salePrice\":%s}%s",
             p->id,p->name,p->desc,
             p->price[0]?p->price:"0",
             p->size,p->icon[0]?p->icon:"🌺",
-            bj,ij,
+            bj,ij,brj,
             p->in_stock?"true":"false",spj,
             i<np-1?",":"");
     }
+    pos += snprintf(json+pos, sizeof(json)-pos,"],\"brands\":[");
+    for(int i=0;i<nb;i++)
+        pos += snprintf(json+pos, sizeof(json)-pos,"\"%s\"%s",brands[i],i<nb-1?",":"");
     snprintf(json+pos, sizeof(json)-pos,"]}");
     wsq_push(json);
     set_st("Syncing products to live website...");
@@ -1448,10 +1453,12 @@ static void tf_on(int idx){
     if(atf>=0&&atf<NF) tfs[atf].active=0;
     if(idx>=0&&idx<NF){ tfs[idx].active=1; tfs[idx].cur=tfs[idx].len; }
     atf=idx; SDL_StartTextInput();
+    brand_dd = (idx == FB_BRAND) ? 1 : 0;
 }
 static void tf_off(void){
     if(atf>=0&&atf<NF) tfs[atf].active=0;
     atf=-1; SDL_StopTextInput();
+    brand_dd = 0;
 }
 static void tf_ins(TF *t,const char *s){
     int sl=strlen(s); if(t->len+sl>=(int)sizeof(t->buf)) return;
@@ -1678,6 +1685,25 @@ static void render(void){
         for(int i=0;i<NF;i++){
             dt(tfs[i].label,tfs[i].rect.x,tfs[i].rect.y-16,fSM,MUTED);
             tf_draw(&tfs[i],atf==i);
+        }
+
+        /* brand dropdown */
+        if(brand_dd && nb>0){
+            SDL_Rect bf = tfs[FB_BRAND].rect;
+            int ddw = bf.w < 160 ? 160 : bf.w;
+            int ddx = bf.x + bf.w - ddw;
+            int ddy = bf.y + bf.h + 2;
+            int rowh = 26;
+            SDL_Rect bbox = {ddx, ddy, ddw, nb*rowh};
+            fr(bbox, PANEL); dr(bbox, GOLD);
+            for(int i=0;i<nb;i++){
+                SDL_Rect row={ddx, ddy+i*rowh, ddw, rowh};
+                int hov = (tfs[FB_BRAND].len>0 &&
+                    strncasecmp(brands[i], tfs[FB_BRAND].buf, tfs[FB_BRAND].len)==0);
+                fr(row, hov ? C(38,28,6) : (i%2==0?PANEL:CARD));
+                SDL_Rect clip={row.x+8,row.y+4,row.w-16,row.h-4};
+                dtclip(brands[i], clip, fSM, hov?LGOLD:TEXT);
+            }
         }
 
         /* in_stock toggle */
@@ -2139,6 +2165,27 @@ static void handle(SDL_Event *e){
             memmove(&prods[sel],&prods[sel+1],(np-sel-1)*sizeof(Prod));
             np--; if(sel>=np&&sel>0) sel--;
             if(np>0) p2f(sel); else img_free(); dirty=1; apply_filter(); return;
+        }
+        /* brand dropdown pick */
+        if(brand_dd && nb>0){
+            SDL_Rect bf = tfs[FB_BRAND].rect;
+            int ddw = bf.w < 160 ? 160 : bf.w;
+            int ddx = bf.x + bf.w - ddw;
+            int ddy = bf.y + bf.h + 2;
+            int rowh = 26;
+            SDL_Rect bbox = {ddx, ddy, ddw, nb*rowh};
+            if(pin(bbox,mx,my)){
+                int idx = (my - ddy) / rowh;
+                if(idx>=0 && idx<nb){
+                    tf_set(&tfs[FB_BRAND], brands[idx]);
+                    if(sel>=0&&sel<np){
+                        strncpy(prods[sel].brand, brands[idx], 47);
+                        dirty=1;
+                    }
+                }
+                brand_dd=0; tf_off(); return;
+            }
+            brand_dd=0;
         }
         /* text fields */
         for(int i=0;i<NF;i++){
