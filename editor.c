@@ -44,7 +44,7 @@
 #define ORDERS_FILE "/home/xmm/Projects/perfume-store/orders.jsonl"
 
 /* ── Limits ─────────────────────────────────────────────────── */
-#define MAX_PRODS  32
+#define MAX_PRODS  128
 #define BUF_MAX    (1<<21)   /* 2 MB */
 #define FB_MAX     1024
 #define FB_ROW      28
