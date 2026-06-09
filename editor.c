@@ -153,9 +153,10 @@ static void wsq_push(const char *json) {
 
 /* ── WS state (atomic-ish, read from main thread) ───────────── */
 typedef enum { WS_OFF=0, WS_CONN, WS_READY } WsState;
-static volatile WsState ws_state  = WS_OFF;
-static volatile int     ws_orders = 0;
-static volatile int     ws_running = 1;
+static volatile WsState ws_state         = WS_OFF;
+static volatile int     ws_orders        = 0;
+static volatile int     ws_running       = 1;
+static volatile int     ws_force_reconnect = 0;
 
 /* ── Notification ────────────────────────────────────────────── */
 static struct {
@@ -193,7 +194,7 @@ static SDL_Rect
     btn_add, btn_del,
     btn_browse, btn_paste, btn_instock,
     btn_save, btn_push, btn_wssync, btn_brands,
-    btn_backup, btn_restore;
+    btn_backup, btn_restore, btn_reconnect;
 
 static int hov_item = -1;
 static int dirty    = 0;
@@ -473,6 +474,15 @@ static void *ws_thread(void *arg){
 
     while(ws_running){
         if(ws_ctx) lws_service(ws_ctx, 50);
+
+        /* force reconnect request from UI */
+        if(ws_force_reconnect){
+            ws_force_reconnect = 0;
+            ws_authed = 0;
+            if(ws_wsi){ lws_close_reason(ws_wsi,LWS_CLOSE_STATUS_NORMAL,NULL,0); ws_wsi=NULL; }
+            ws_state = WS_OFF;
+            last_try = 0;
+        }
 
         /* reconnect logic */
         Uint32 now = SDL_GetTicks();
@@ -1443,10 +1453,11 @@ static void layout(void){
 
     /* right panel bottom buttons */
     int pw=120;
-    btn_wssync  =(SDL_Rect){rx+PAD,            ry+(BAR_H-34)/2, pw,   34};
-    btn_history =(SDL_Rect){rx+PAD+pw+8,       ry+(BAR_H-34)/2, pw,   34};
-    btn_save    =(SDL_Rect){WIN_W-PAD-pw*2-8,  ry+(BAR_H-34)/2, pw,   34};
-    btn_push    =(SDL_Rect){WIN_W-PAD-pw,       ry+(BAR_H-34)/2, pw,   34};
+    btn_wssync   =(SDL_Rect){rx+PAD,             ry+(BAR_H-34)/2, pw,   34};
+    btn_reconnect=(SDL_Rect){rx+PAD+pw+8,        ry+(BAR_H-34)/2, 34,   34};
+    btn_history  =(SDL_Rect){rx+PAD+pw+8+34+6,   ry+(BAR_H-34)/2, pw,   34};
+    btn_save     =(SDL_Rect){WIN_W-PAD-pw*2-8,   ry+(BAR_H-34)/2, pw,   34};
+    btn_push     =(SDL_Rect){WIN_W-PAD-pw,        ry+(BAR_H-34)/2, pw,   34};
 
     /* search bar (left panel, between header and list) */
     search_rect=(SDL_Rect){PAD, 46, LIST_W-PAD*2, 28};
@@ -1802,6 +1813,9 @@ static void render(void){
     SDL_Color wfc=ws_state==WS_READY?C(120,210,255):MUTED;
     btn(btn_wssync,"Sync Live",wbc,wfc);
     if(ws_state==WS_READY) glow(btn_wssync,C(60,160,220),3);
+    /* ↻ reconnect button */
+    fr(btn_reconnect, C(28,22,40)); dr(btn_reconnect, C(70,55,90));
+    dtctr("↻", btn_reconnect, fMD, ws_state==WS_READY?C(120,210,255):C(160,120,200));
     btn(btn_history,"History",C(22,20,38),hist.open?LGOLD:MUTED);
     if(hist.open) glow(btn_history,GOLD,2);
     btn(btn_save,  "Save HTML",C(10,40,16),GRN);
@@ -2253,6 +2267,7 @@ static void handle(SDL_Event *e){
         /* paste */
         if(pin(btn_paste,mx,my)){ f2p(sel); tf_off(); paste_clip(); return; }
         if(pin(btn_wssync, mx,my)){ f2p(sel); ws_send_products(); return; }
+        if(pin(btn_reconnect,mx,my)){ ws_force_reconnect=1; set_st("Reconnecting..."); return; }
         /* history */
         if(pin(btn_history,mx,my)){ hist.open=!hist.open; if(hist.open) load_hist(); return; }
         /* save */
