@@ -496,35 +496,38 @@ static void *ws_thread(void *arg){
     return NULL;
 }
 
+static const char B64T[]="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+static void write_img_b64(FILE *out, const char *relpath); /* defined later */
+
 static void ws_send_products(void){
     if(ws_state != WS_READY){ set_st("WebSocket not connected yet"); return; }
-    char json[8192];
-    int  pos = 0;
-    pos += snprintf(json+pos, sizeof(json)-pos,
-        "{\"type\":\"update_products\",\"secret\":\"%s\",\"products\":[", WS_SECRET);
-    for(int i=0;i<np&&pos<(int)sizeof(json)-512;i++){
+    /* build JSON with full base64 images into a dynamic buffer */
+    char *buf = NULL; size_t bsz = 0;
+    FILE *out = open_memstream(&buf, &bsz);
+    if(!out){ set_st("ERROR: open_memstream failed"); return; }
+    fprintf(out,"{\"type\":\"update_products\",\"secret\":\"%s\",\"products\":[",WS_SECRET);
+    for(int i=0;i<np;i++){
         Prod *p=&prods[i];
-        char bj[48],ij[280],spj[40],brj[80];
-        if(p->badge[0])      snprintf(bj, sizeof(bj), "\"%s\"",p->badge); else strcpy(bj,"null");
-        if(p->image[0])      snprintf(ij, sizeof(ij), "\"%s\"",p->image); else strcpy(ij,"null");
-        if(p->sale_price[0]) snprintf(spj,sizeof(spj),"%s",    p->sale_price); else strcpy(spj,"null");
-        if(p->brand[0])      snprintf(brj,sizeof(brj),"\"%s\"",p->brand); else strcpy(brj,"null");
-        pos += snprintf(json+pos, sizeof(json)-pos,
-            "{\"id\":%d,\"name\":\"%s\",\"desc\":\"%s\","
+        char bj[80],brj[80],spj[40];
+        if(p->badge[0]) snprintf(bj,sizeof(bj),"\"%s\"",p->badge); else strcpy(bj,"null");
+        if(p->brand[0]) snprintf(brj,sizeof(brj),"\"%s\"",p->brand); else strcpy(brj,"null");
+        if(p->sale_price[0]) snprintf(spj,sizeof(spj),"%s",p->sale_price); else strcpy(spj,"null");
+        fprintf(out,"{\"id\":%d,\"name\":\"%s\",\"desc\":\"%s\","
             "\"price\":%s,\"size\":\"%s\",\"icon\":\"%s\","
-            "\"badge\":%s,\"image\":%s,\"brand\":%s,\"inStock\":%s,\"salePrice\":%s}%s",
+            "\"badge\":%s,\"brand\":%s,\"inStock\":%s,\"salePrice\":%s,\"image\":",
             p->id,p->name,p->desc,
             p->price[0]?p->price:"0",
-            p->size,p->icon[0]?p->icon:"🌺",
-            bj,ij,brj,
-            p->in_stock?"true":"false",spj,
-            i<np-1?",":"");
+            p->size,p->icon[0]?p->icon:"🌹",
+            bj,brj,p->in_stock?"true":"false",spj);
+        if(p->image[0]) write_img_b64(out,p->image); else fputs("null",out);
+        fprintf(out,"}%s",i<np-1?",":"");
     }
-    pos += snprintf(json+pos, sizeof(json)-pos,"],\"brands\":[");
-    for(int i=0;i<nb;i++)
-        pos += snprintf(json+pos, sizeof(json)-pos,"\"%s\"%s",brands[i],i<nb-1?",":"");
-    snprintf(json+pos, sizeof(json)-pos,"]}");
-    wsq_push(json);
+    fputs("],\"brands\":[",out);
+    for(int i=0;i<nb;i++) fprintf(out,"\"%s\"%s",brands[i],i<nb-1?",":"");
+    fputs("]}",out);
+    fclose(out);
+    wsq_push(buf);
+    free(buf);
     set_st("Syncing products to live website...");
 }
 
@@ -827,9 +830,6 @@ static void html_save(void){
     free(out); free(buf); free(njs);
     dirty=0; set_st("HTML saved! Use Push or Sync to publish.");
 }
-
-static const char B64T[]="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-static void write_img_b64(FILE *out, const char *relpath);
 
 /* ═══════════════════════════════════════════════════════════════
    Write data.json (base64 images) for Android app
