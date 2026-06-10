@@ -277,16 +277,63 @@
     .detail-size { font-size:.62rem; color:var(--muted); letter-spacing:.14em; text-transform:uppercase; margin-top:6px; }
     .detail-add-btn {
       width:100%; margin-top:20px;
-      background:linear-gradient(135deg, var(--rose-dk), var(--rose), #E86070);
-      color:#fff; border:none; padding:16px; border-radius:8px;
-      font-size:.76rem; font-weight:700; letter-spacing:.2em; text-transform:uppercase;
+      background: linear-gradient(180deg, #F05880 0%, #C0306A 55%, #A02055 100%);
+      color:#fff; border:none; padding:17px; border-radius:12px;
+      font-size:.76rem; font-weight:700; letter-spacing:.22em; text-transform:uppercase;
       cursor:pointer; font-family:'Lato', sans-serif;
-      transition:opacity .2s, transform .12s, box-shadow .2s;
-      box-shadow: 0 4px 18px rgba(192,53,106,.40);
+      position:relative; overflow:hidden;
+      box-shadow:
+        0 7px 0 #7A0830,
+        0 9px 2px rgba(0,0,0,.18),
+        0 12px 24px rgba(192,53,106,.38);
+      transform: translateY(0);
+      transition: transform .1s ease, box-shadow .1s ease, background .3s ease;
     }
-    .detail-add-btn:hover { opacity:.90; box-shadow:0 6px 28px rgba(192,53,106,.55); transform:translateY(-1px); }
-    .detail-add-btn:active { transform:scale(.98); }
-    .detail-add-btn:disabled { opacity:.35; cursor:not-allowed; background:var(--bdr); box-shadow:none; color:var(--muted); }
+    /* top shine layer */
+    .detail-add-btn::before {
+      content:''; position:absolute; inset:0; border-radius:12px;
+      background: linear-gradient(180deg, rgba(255,255,255,.22) 0%, rgba(255,255,255,0) 45%);
+      pointer-events:none;
+    }
+    /* shimmer sweep */
+    .detail-add-btn::after {
+      content:''; position:absolute; top:-60%; left:-80%;
+      width:50%; height:220%;
+      background: rgba(255,255,255,.16);
+      transform: skewX(-22deg);
+      transition: left .55s ease;
+      pointer-events:none;
+    }
+    .detail-add-btn:hover::after { left:130%; }
+    .detail-add-btn:hover {
+      transform: translateY(-2px);
+      box-shadow:
+        0 9px 0 #7A0830,
+        0 11px 2px rgba(0,0,0,.18),
+        0 16px 32px rgba(192,53,106,.48);
+    }
+    .detail-add-btn:active {
+      transform: translateY(6px);
+      box-shadow:
+        0 1px 0 #7A0830,
+        0 2px 2px rgba(0,0,0,.15),
+        0 4px 10px rgba(192,53,106,.22);
+    }
+    .detail-add-btn.btn-success {
+      background: linear-gradient(180deg, #5DE898 0%, #28A060 55%, #1A7840 100%) !important;
+      box-shadow:
+        0 7px 0 #0A5028,
+        0 9px 2px rgba(0,0,0,.18),
+        0 12px 24px rgba(40,160,96,.38) !important;
+      pointer-events:none;
+      animation: btn-success-pop .25s cubic-bezier(.36,.07,.19,.97);
+    }
+    @keyframes btn-success-pop {
+      0%  { transform:translateY(6px) scale(.97); }
+      60% { transform:translateY(-3px) scale(1.02); }
+      100%{ transform:translateY(0)   scale(1); }
+    }
+    .detail-add-btn:disabled:not(.btn-success) { opacity:.35; cursor:not-allowed; background:var(--bdr) !important; box-shadow:0 3px 0 #bbb, 0 5px 10px rgba(0,0,0,.08) !important; color:var(--muted); transform:none; }
 
     /* ── Cart ── */
     .cart-overlay { position:fixed; inset:0; background:rgba(140,30,60,.26); backdrop-filter:blur(10px); z-index:300; display:none; opacity:0; transition:opacity .3s; }
@@ -1222,11 +1269,29 @@
   function addToCartFromDetail(id) {
     const p = products.find(x => x.id === id);
     if (!p || p.inStock === false) return;
+    const btn = document.getElementById('detailAddBtn');
+    if (!btn || btn.disabled) return;
+
+    btn.disabled = true;
+    /* force 3D press frame */
+    btn.style.transform = 'translateY(6px)';
+    btn.style.boxShadow = '0 1px 0 #7A0830, 0 2px 2px rgba(0,0,0,.15), 0 4px 10px rgba(192,53,106,.22)';
+
     const srcEl = document.querySelector('#detailBody .detail-img-wrap, #detailBody .detail-emoji-wrap');
-    cart[id] = (cart[id] || 0) + 1;
-    updateCartUI();
-    flyToCart(srcEl);
-    closeDetail();
+
+    setTimeout(() => {
+      /* release → success */
+      btn.style.transform = '';
+      btn.style.boxShadow = '';
+      btn.classList.add('btn-success');
+      btn.innerHTML = '✓ &nbsp; AGREGADO';
+
+      cart[id] = (cart[id] || 0) + 1;
+      updateCartUI();
+      flyToCart(srcEl);
+
+      setTimeout(() => closeDetail(), 820);
+    }, 160);
   }
 
   /* ── Fly-to-cart animation ── */
