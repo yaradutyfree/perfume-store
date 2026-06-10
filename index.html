@@ -97,6 +97,31 @@
       display:none; align-items:center; justify-content:center;
     }
 
+    /* ── Location banner ── */
+    .location-banner {
+      background: linear-gradient(135deg, #7A0830 0%, #A8205A 40%, #C0306A 70%, #8B1040 100%);
+      text-align:center; padding:7px 16px;
+      display:flex; align-items:center; justify-content:center; gap:10px;
+      flex-wrap:wrap;
+    }
+    .loc-brand {
+      font-family:'Playfair Display', serif; font-size:.80rem; font-weight:700;
+      letter-spacing:.14em; text-transform:uppercase;
+      background: linear-gradient(135deg, #FFE8A0 0%, #FFD060 50%, #FFF0C0 100%);
+      -webkit-background-clip:text; -webkit-text-fill-color:transparent; background-clip:text;
+    }
+    .loc-dot { color:rgba(255,220,120,.70); font-size:.55rem; }
+    .loc-text {
+      font-size:.68rem; letter-spacing:.12em; text-transform:uppercase;
+      color:rgba(255,255,255,.92); font-weight:500;
+    }
+    body.dark .location-banner { background:linear-gradient(135deg,#3A0818 0%,#5A1030 50%,#3A0818 100%); }
+    @media (max-width:480px) {
+      .location-banner { padding:6px 12px; gap:6px; }
+      .loc-brand { font-size:.72rem; }
+      .loc-text { font-size:.60rem; letter-spacing:.08em; }
+    }
+
     /* ── Search ── */
     .search-wrap {
       background: linear-gradient(135deg, #FFF0F5 0%, #FFF8F0 100%);
@@ -544,6 +569,13 @@
     </div>
   </div>
 </header>
+
+<!-- Location banner -->
+<div class="location-banner">
+  <span class="loc-brand">YaraDutyFree</span>
+  <span class="loc-dot">✦</span>
+  <span class="loc-text">San Andrés Isla &nbsp;·&nbsp; Envío A Nivel Nacional</span>
+</div>
 
 <!-- Search -->
 <div class="search-wrap">
