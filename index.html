@@ -370,9 +370,25 @@
     .customer-dialog h3 { font-family:'Playfair Display', serif; font-size:1.05rem; font-weight:700; letter-spacing:.12em; text-transform:uppercase;
       background:linear-gradient(135deg,var(--rose-dk),var(--rose),var(--gold)); -webkit-background-clip:text; -webkit-text-fill-color:transparent; background-clip:text;
       margin-bottom:18px; }
-    .customer-input { width:100%; background:#fff; border:1.5px solid var(--bdr); color:var(--text); padding:11px 14px; font-size:.84rem; font-family:'Lato', sans-serif; outline:none; transition:border-color .2s, box-shadow .2s; margin-bottom:11px; border-radius:8px; }
+    .customer-input { width:100%; background:#FFF0F4; border:1.5px solid var(--bdr); color:#1A0810; -webkit-text-fill-color:#1A0810; padding:11px 14px; font-size:.84rem; font-family:'Lato', sans-serif; outline:none; transition:border-color .2s, box-shadow .2s; margin-bottom:11px; border-radius:8px; }
     .customer-input:focus { border-color:var(--rose); box-shadow:0 0 0 3px rgba(192,53,106,.12); }
-    .customer-input::placeholder { color:var(--muted); }
+    .customer-input::placeholder { color:#B07888; opacity:1; -webkit-text-fill-color:#B07888; }
+    /* kill Chrome/WebKit autofill colour override */
+    .customer-input:-webkit-autofill,
+    .customer-input:-webkit-autofill:hover,
+    .customer-input:-webkit-autofill:focus {
+      -webkit-box-shadow: 0 0 0 40px #FFF0F4 inset !important;
+      -webkit-text-fill-color: #1A0810 !important;
+      caret-color: #1A0810;
+    }
+    body.dark .customer-input { background:#201018; color:#F2E8F0; -webkit-text-fill-color:#F2E8F0; border-color:#3A1828; }
+    body.dark .customer-input::placeholder { color:#7A5060; -webkit-text-fill-color:#7A5060; }
+    body.dark .customer-input:-webkit-autofill,
+    body.dark .customer-input:-webkit-autofill:hover,
+    body.dark .customer-input:-webkit-autofill:focus {
+      -webkit-box-shadow: 0 0 0 40px #201018 inset !important;
+      -webkit-text-fill-color: #F2E8F0 !important;
+    }
     .customer-btns { display:flex; gap:10px; margin-top:4px; }
     .customer-confirm { flex:1; background:linear-gradient(135deg,var(--rose-dk),var(--rose)); color:#fff; border:none; padding:13px; border-radius:8px; font-size:.72rem; font-weight:700; letter-spacing:.16em; text-transform:uppercase; cursor:pointer; font-family:'Lato', sans-serif; transition:opacity .2s, box-shadow .2s; box-shadow:0 3px 14px rgba(192,53,106,.35); }
     .customer-confirm:hover { opacity:.88; box-shadow:0 5px 20px rgba(192,53,106,.50); }
