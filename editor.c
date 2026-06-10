@@ -7,6 +7,10 @@
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_ttf.h>
 #include <SDL2/SDL_image.h>
+#include <SDL2/SDL_syswm.h>
+#include <X11/Xlib.h>
+#include <X11/Xatom.h>
+#include "icon_data.h"
 #include <libwebsockets.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -94,6 +98,7 @@ static int  nb = 0;
 typedef struct {
     char     buf[256];
     int      len, cur, active;
+    int      sel;   /* selection anchor; -1 = no selection */
     SDL_Rect rect;
     char     label[32];
     char     hint[64];
@@ -911,7 +916,7 @@ static void git_push(void){
    ═══════════════════════════════════════════════════════════════ */
 static void tf_set(TF *t,const char *s){
     strncpy(t->buf,s?s:"",255); t->buf[255]=0;
-    t->len=strlen(t->buf); t->cur=t->len;
+    t->len=strlen(t->buf); t->cur=t->len; t->sel=-1;
 }
 static void p2f(int i){
     if(i<0||i>=np) return;
@@ -1498,24 +1503,39 @@ static void layout(void){
     btn_paste  =(SDL_Rect){fx+168,      img_y,    160, 34};
 }
 
+/* x-position in pixels of character index i inside field t */
+static int tf_cx(TF *t,int i){
+    if(i<=0) return t->rect.x+8;
+    char tmp[256]; int n=i<t->len?i:t->len;
+    memcpy(tmp,t->buf,n); tmp[n]=0;
+    int tw,th; TTF_SizeUTF8(fMD,tmp,&tw,&th);
+    return t->rect.x+8+tw;
+}
+
 /* ═══════════════════════════════════════════════════════════════
    Text field
    ═══════════════════════════════════════════════════════════════ */
 static void tf_draw(TF *t,int active){
     fr(t->rect,CARD); dr(t->rect,active?GOLD:BDR);
+    /* selection highlight */
+    if(active&&t->sel>=0&&t->sel!=t->cur){
+        int lo=t->sel<t->cur?t->sel:t->cur;
+        int hi=t->sel<t->cur?t->cur:t->sel;
+        int x0=tf_cx(t,lo), x1=tf_cx(t,hi);
+        SDL_Rect sr={x0,t->rect.y+3,x1-x0,t->rect.h-6};
+        sc(C(60,80,160)); SDL_RenderFillRect(gren,&sr);
+    }
     SDL_Rect clip={t->rect.x+8,t->rect.y,t->rect.w-16,t->rect.h};
     if(t->len) dtclip(t->buf,clip,fMD,TEXT); else dtclip(t->hint,clip,fMD,MUTED);
-    if(active&&(SDL_GetTicks()/530)%2==0){
-        int cx=t->rect.x+8;
-        if(t->cur>0){ char tmp[256]; int n=t->cur<t->len?t->cur:t->len;
-            memcpy(tmp,t->buf,n); tmp[n]=0;
-            int tw,th; TTF_SizeUTF8(fMD,tmp,&tw,&th); cx+=tw; }
+    /* cursor: show when no selection and blink tick is on */
+    if(active&&t->sel<0&&(SDL_GetTicks()/530)%2==0){
+        int cx=tf_cx(t,t->cur);
         sc(GOLD); SDL_RenderDrawLine(gren,cx,t->rect.y+5,cx,t->rect.y+t->rect.h-5);
     }
 }
 static void tf_on(int idx){
     if(atf>=0&&atf<NF) tfs[atf].active=0;
-    if(idx>=0&&idx<NF){ tfs[idx].active=1; tfs[idx].cur=tfs[idx].len; }
+    if(idx>=0&&idx<NF){ tfs[idx].active=1; tfs[idx].cur=tfs[idx].len; tfs[idx].sel=-1; }
     atf=idx; SDL_StartTextInput();
     brand_dd = (idx == FB_BRAND) ? 1 : 0;
 }
@@ -1524,17 +1544,43 @@ static void tf_off(void){
     atf=-1; SDL_StopTextInput();
     brand_dd = 0;
 }
+/* Delete the selected range [lo,hi) and place cursor at lo. */
+static void tf_del_sel(TF *t){
+    if(t->sel<0) return;
+    int lo=t->sel<t->cur?t->sel:t->cur;
+    int hi=t->sel<t->cur?t->cur:t->sel;
+    memmove(t->buf+lo,t->buf+hi,t->len-hi+1);
+    t->len-=(hi-lo); t->cur=lo; t->sel=-1;
+}
 static void tf_ins(TF *t,const char *s){
+    if(t->sel>=0) tf_del_sel(t);          /* replace selection */
     int sl=strlen(s); if(t->len+sl>=(int)sizeof(t->buf)) return;
     memmove(t->buf+t->cur+sl,t->buf+t->cur,t->len-t->cur+1);
     memcpy(t->buf+t->cur,s,sl); t->len+=sl; t->cur+=sl;
 }
 static void tf_bs(TF *t){
+    if(t->sel>=0){ tf_del_sel(t); return; }  /* delete selection */
     if(!t->cur) return;
     memmove(t->buf+t->cur-1,t->buf+t->cur,t->len-t->cur+1);
     t->len--; t->cur--;
 }
-static void tf_clr(TF *t){ t->buf[0]=0; t->len=t->cur=0; }
+static void tf_clr(TF *t){ t->buf[0]=0; t->len=t->cur=t->sel=0; t->sel=-1; }
+/* Ctrl+C / Ctrl+X */
+static void tf_copy(TF *t){
+    if(t->sel<0){ SDL_SetClipboardText(t->buf); return; }
+    int lo=t->sel<t->cur?t->sel:t->cur;
+    int hi=t->sel<t->cur?t->cur:t->sel;
+    char tmp[256]; int n=hi-lo; if(n<=0)return;
+    memcpy(tmp,t->buf+lo,n); tmp[n]=0;
+    SDL_SetClipboardText(tmp);
+}
+static void tf_cut(TF *t){ tf_copy(t); if(t->sel>=0) tf_del_sel(t); else tf_clr(t); }
+/* Ctrl+V */
+static void tf_paste(TF *t){
+    if(!SDL_HasClipboardText()) return;
+    char *clip=SDL_GetClipboardText();
+    if(clip){ tf_ins(t,clip); SDL_free(clip); }
+}
 
 /* ═══════════════════════════════════════════════════════════════
    Render
@@ -2301,11 +2347,32 @@ static void handle(SDL_Event *e){
         if(atf<0) return;
         TF *t=&tfs[atf];
         if(k==SDLK_BACKSPACE){ tf_bs(t); f2p(sel); }
-        else if(k==SDLK_LEFT&&t->cur>0)    t->cur--;
-        else if(k==SDLK_RIGHT&&t->cur<t->len) t->cur++;
-        else if(k==SDLK_HOME) t->cur=0;
-        else if(k==SDLK_END)  t->cur=t->len;
-        else if(k==SDLK_a&&(e->key.keysym.mod&KMOD_CTRL)){ tf_clr(t); f2p(sel); }
+        else if(k==SDLK_LEFT){
+            if(e->key.keysym.mod&KMOD_SHIFT){
+                if(t->sel<0) t->sel=t->cur;  /* start selection */
+                if(t->cur>0) t->cur--;
+                if(t->sel==t->cur) t->sel=-1; /* collapsed */
+            } else { t->sel=-1; if(t->cur>0) t->cur--; }
+        }
+        else if(k==SDLK_RIGHT){
+            if(e->key.keysym.mod&KMOD_SHIFT){
+                if(t->sel<0) t->sel=t->cur;
+                if(t->cur<t->len) t->cur++;
+                if(t->sel==t->cur) t->sel=-1;
+            } else { t->sel=-1; if(t->cur<t->len) t->cur++; }
+        }
+        else if(k==SDLK_HOME){
+            if(e->key.keysym.mod&KMOD_SHIFT){ if(t->sel<0)t->sel=t->cur; t->cur=0; if(t->sel==t->cur)t->sel=-1; }
+            else { t->sel=-1; t->cur=0; }
+        }
+        else if(k==SDLK_END){
+            if(e->key.keysym.mod&KMOD_SHIFT){ if(t->sel<0)t->sel=t->cur; t->cur=t->len; if(t->sel==t->cur)t->sel=-1; }
+            else { t->sel=-1; t->cur=t->len; }
+        }
+        else if(k==SDLK_a&&(e->key.keysym.mod&KMOD_CTRL)){ t->sel=0; t->cur=t->len; }
+        else if(k==SDLK_c&&(e->key.keysym.mod&KMOD_CTRL)){ tf_copy(t); }
+        else if(k==SDLK_x&&(e->key.keysym.mod&KMOD_CTRL)){ tf_cut(t); f2p(sel); }
+        else if(k==SDLK_v&&(e->key.keysym.mod&KMOD_CTRL)){ tf_paste(t); f2p(sel); }
         else if(k==SDLK_s&&(e->key.keysym.mod&KMOD_CTRL)){ f2p(sel); html_save(); }
         else if(k==SDLK_TAB){ f2p(sel); tf_on((atf+1)%NF); }
         else if(k==SDLK_RETURN||k==SDLK_ESCAPE) tf_off();
@@ -2343,6 +2410,35 @@ static void ws_poll(void){
     }
 }
 
+/* Set _NET_WM_ICON via X11 directly (SDL_SetWindowIcon doesn't always
+   propagate to the taskbar on all compositors). */
+static void set_x11_icon(SDL_Window *win){
+    SDL_SysWMinfo wm; SDL_VERSION(&wm.version);
+    if(!SDL_GetWindowWMInfo(win,&wm)||wm.subsystem!=SDL_SYSWM_X11) return;
+    SDL_RWops *rw=SDL_RWFromConstMem(icon_png,icon_png_len);
+    SDL_Surface *s=IMG_Load_RW(rw,1);
+    if(!s) return;
+    /* Convert to ARGB8888 so we can read pixels */
+    SDL_Surface *a=SDL_ConvertSurfaceFormat(s,SDL_PIXELFORMAT_ARGB8888,0);
+    SDL_FreeSurface(s);
+    if(!a) return;
+    int w=a->w, h=a->h;
+    unsigned long *data=malloc((2+w*h)*sizeof(unsigned long));
+    if(data){
+        data[0]=(unsigned long)w; data[1]=(unsigned long)h;
+        Uint32 *px=(Uint32*)a->pixels;
+        for(int i=0;i<w*h;i++) data[2+i]=(unsigned long)px[i];
+        Display *dpy=wm.info.x11.display;
+        Window   xw =wm.info.x11.window;
+        Atom prop=XInternAtom(dpy,"_NET_WM_ICON",False);
+        XChangeProperty(dpy,xw,prop,XA_CARDINAL,32,PropModeReplace,
+                        (unsigned char*)data,(2+w*h));
+        XFlush(dpy);
+        free(data);
+    }
+    SDL_FreeSurface(a);
+}
+
 /* ═══════════════════════════════════════════════════════════════
    main
    ═══════════════════════════════════════════════════════════════ */
@@ -2361,6 +2457,8 @@ int main(void){
         SDL_WINDOWPOS_CENTERED,SDL_WINDOWPOS_CENTERED,
         WIN_W,WIN_H, SDL_WINDOW_SHOWN|SDL_WINDOW_RESIZABLE);
     if(!gwin){ fprintf(stderr,"Window: %s\n",SDL_GetError()); return 1; }
+
+    set_x11_icon(gwin);
 
     gren=SDL_CreateRenderer(gwin,-1,
         SDL_RENDERER_ACCELERATED|SDL_RENDERER_PRESENTVSYNC);
