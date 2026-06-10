@@ -30,9 +30,15 @@ wss.on('connection', (ws, req) => {
 
     console.log(`[+] connection from ${req.socket.remoteAddress}`);
 
-    /* send current state immediately on connect */
+    /* Send the product blast to viewers only, slightly deferred:
+       admin clients (Android/Linux editors) auth within ~1s of
+       connecting and already have their own local data — sending
+       them the multi-MB base64 payload made auth take forever. */
     if (products.length > 0) {
-        send(ws, { type: 'products', products, brands });
+        setTimeout(() => {
+            if (ws.role === 'viewer' && ws.readyState === WebSocket.OPEN)
+                send(ws, { type: 'products', products, brands });
+        }, 2500);
     }
     send(ws, { type: 'order_count', count: orderCount });
 
@@ -53,8 +59,15 @@ wss.on('connection', (ws, req) => {
                 ws.role = 'admin';
                 adminWs = ws;
                 console.log('[admin] connected');
-                /* send full state to admin */
-                send(ws, { type: 'state', products, brands, orderCount });
+                /* lightweight state — no product/image payload;
+                   admins keep local data, this makes auth instant */
+                send(ws, { type: 'state', brands, orderCount,
+                           productCount: products.length });
+                break;
+
+            /* ── Explicit full product request ── */
+            case 'get_products':
+                send(ws, { type: 'products', products, brands });
                 break;
 
             /* ── Admin pushes product update ── */
@@ -65,7 +78,10 @@ wss.on('connection', (ws, req) => {
                 console.log(`[admin] updated ${products.length} products, ${brands.length} brands`);
                 /* broadcast to all viewers */
                 broadcast('viewer', { type: 'products', products, brands });
-                send(ws, { type: 'ack', products, brands, message: 'Products broadcast to all clients' });
+                /* lightweight ack — don't echo the multi-MB payload back */
+                send(ws, { type: 'ack', productCount: products.length,
+                           brandCount: brands.length,
+                           message: 'Products broadcast to all clients' });
                 break;
 
             /* ── Customer places order ── */

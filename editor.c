@@ -940,6 +940,38 @@ static void f2p(int i){
     dirty=1;
 }
 
+/* ── Delete product (with confirmation) ─────────────────────── */
+static int confirm_delete(const char *name){
+    SDL_MessageBoxButtonData btns[2]={
+        {SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT,0,"Cancelar"},
+        {SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT,1,"Eliminar"},
+    };
+    char msg[160];
+    snprintf(msg,sizeof(msg),"¿Eliminar \"%s\" de la tienda?",
+             name&&name[0]?name:"(unnamed)");
+    SDL_MessageBoxData mb={SDL_MESSAGEBOX_WARNING,gwin,
+                           "Eliminar producto",msg,2,btns,NULL};
+    int hit=0;
+    if(SDL_ShowMessageBox(&mb,&hit)<0) return 1; /* dialog unavailable → proceed */
+    return hit==1;
+}
+
+static void delete_at(int pi){
+    if(pi<0||pi>=np) return;
+    char nm[64]; strncpy(nm,prods[pi].name,63); nm[63]=0;
+    memmove(&prods[pi],&prods[pi+1],(np-pi-1)*sizeof(Prod));
+    np--;
+    if(sel>pi) sel--;
+    else if(sel==pi){
+        if(sel>=np) sel=np>0?np-1:0;
+        if(np>0) p2f(sel); else img_free();
+    }
+    dirty=1; apply_filter();
+    char msg[110];
+    snprintf(msg,sizeof(msg),"\"%s\" eliminado — Save HTML para confirmar",nm[0]?nm:"(unnamed)");
+    set_st(msg);
+}
+
 /* ═══════════════════════════════════════════════════════════════
    File browser
    ═══════════════════════════════════════════════════════════════ */
@@ -1206,10 +1238,20 @@ static void write_img_b64(FILE *out, const char *relpath){
     FILE *f=fopen(relpath,"rb");
     if(!f){ snprintf(full,sizeof(full),"%s/%s",GIT_DIR,relpath); f=fopen(full,"rb"); }
     if(!f){ fputs("null",out); return; }
-    const char *ext=strrchr(relpath,'.'); if(!ext) ext=".jpg";
-    char mime[32];
-    if(!strcasecmp(ext+1,"jpg")||!strcasecmp(ext+1,"jpeg")) strcpy(mime,"image/jpeg");
-    else snprintf(mime,sizeof(mime),"image/%s",ext+1);
+    /* detect mime from magic bytes — extension can lie (png saved as .jpg) */
+    unsigned char hdr[12]={0};
+    size_t hn=fread(hdr,1,12,f);
+    fseek(f,0,SEEK_SET);
+    char mime[32]="image/jpeg";
+    if(hn>=8&&hdr[0]==0x89&&hdr[1]=='P'&&hdr[2]=='N'&&hdr[3]=='G') strcpy(mime,"image/png");
+    else if(hn>=12&&!memcmp(hdr,"RIFF",4)&&!memcmp(hdr+8,"WEBP",4)) strcpy(mime,"image/webp");
+    else if(hn>=6&&!memcmp(hdr,"GIF8",4)) strcpy(mime,"image/gif");
+    else if(hn>=2&&hdr[0]==0xFF&&hdr[1]==0xD8) strcpy(mime,"image/jpeg");
+    else {
+        const char *ext=strrchr(relpath,'.');
+        if(ext&&strcasecmp(ext+1,"jpg")&&strcasecmp(ext+1,"jpeg"))
+            snprintf(mime,sizeof(mime),"image/%s",ext+1);
+    }
     fprintf(out,"\"data:%s;base64,",mime);
     unsigned char ib[3]; size_t n;
     while((n=fread(ib,1,3,f))>0){
@@ -1438,6 +1480,89 @@ static void do_restore(void){
     dirty=1; apply_filter();
     char msg[80]; snprintf(msg,sizeof(msg),"Restored %d products, %d brands",np,nb);
     set_st(msg);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Fill missing images from data.json
+   The Android editor writes image:null into index.html and keeps
+   the real base64 images only in data.json — so after an Android
+   push, index.html alone has no images. Recover them here.
+   ═══════════════════════════════════════════════════════════════ */
+static void data_json_fill_images(void){
+    char path[512]; snprintf(path,sizeof(path),"%s/data.json",GIT_DIR);
+    FILE *f=fopen(path,"rb"); if(!f) return;
+    fseek(f,0,SEEK_END); long fsz=ftell(f); rewind(f);
+    char *json=malloc(fsz+1); if(!json){ fclose(f); return; }
+    fread(json,1,fsz,f); fclose(f); json[fsz]=0;
+
+    const char *parr=strstr(json,"\"products\"");
+    if(!parr){ free(json); return; }
+    parr=strchr(parr,'['); if(!parr){ free(json); return; }
+    parr++;
+    mkdir(IMG_DIR,0755);
+
+    int filled=0;
+    const char *end;
+    const char *obj=next_obj(parr,&end);
+    while(obj){
+        size_t olen=end-obj;
+        char *blk=malloc(olen+1); if(!blk) break;
+        memcpy(blk,obj,olen); blk[olen]=0;
+
+        char tmp[32]={0}; jstr(blk,"id",tmp,sizeof(tmp));
+        int id=atoi(tmp);
+        for(int i=0;i<np;i++){
+            if(prods[i].id!=id||prods[i].image[0]) continue;
+            char *imgval=jfield_big(blk,"image");
+            if(imgval&&strncmp(imgval,"data:",5)==0){
+                const char *b64=strstr(imgval,"base64,");
+                if(b64){
+                    const char *ext="jpg";
+                    if(strstr(imgval,"image/png"))       ext="png";
+                    else if(strstr(imgval,"image/webp")) ext="webp";
+                    else if(strstr(imgval,"image/gif"))  ext="gif";
+                    b64+=7;
+                    char imgpath[512];
+                    snprintf(imgpath,sizeof(imgpath),"%s/prod_%d.%s",IMG_DIR,id,ext);
+                    if(b64_to_file(b64,strlen(b64),imgpath)>0){
+                        snprintf(prods[i].image,sizeof(prods[i].image),
+                                 "images/prod_%d.%s",id,ext);
+                        filled++;
+                    }
+                }
+            } else if(imgval&&imgval[0]){
+                strncpy(prods[i].image,imgval,255);
+                filled++;
+            }
+            free(imgval);
+            break;
+        }
+        free(blk);
+        obj=next_obj(end,&end);
+    }
+    free(json);
+
+    /* last resort: a previously decoded local file images/prod_<id>.* */
+    for(int i=0;i<np;i++){
+        if(prods[i].image[0]) continue;
+        const char *exts[]={"jpg","png","webp","gif"};
+        for(int e=0;e<4;e++){
+            char fpath[512];
+            snprintf(fpath,sizeof(fpath),"%s/prod_%d.%s",IMG_DIR,prods[i].id,exts[e]);
+            if(!access(fpath,F_OK)){
+                snprintf(prods[i].image,sizeof(prods[i].image),
+                         "images/prod_%d.%s",prods[i].id,exts[e]);
+                filled++;
+                break;
+            }
+        }
+    }
+
+    if(filled){
+        char msg[96];
+        snprintf(msg,sizeof(msg),"Loaded %d products, %d brands — %d images from data.json",np,nb,filled);
+        set_st(msg);
+    }
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -1696,17 +1821,25 @@ static void render(void){
         }
         SDL_SetRenderDrawBlendMode(gren,SDL_BLENDMODE_NONE);
         /* name */
-        SDL_Rect nc={PAD+10,iy+7,LIST_W-PAD*2-14,18};
+        SDL_Rect nc={PAD+10,iy+7,LIST_W-PAD*2-36,18};
         dtclip(prods[pi].name[0]?prods[pi].name:"(unnamed)",nc,fMD,is_sel?LGOLD:TEXT);
         /* price */
         char pt[32]; snprintf(pt,sizeof(pt),"$%s · %s",prods[pi].price,prods[pi].size);
-        SDL_Rect pc={PAD+10,iy+27,LIST_W-PAD*2-14,14}; dtclip(pt,pc,fSM,is_sel?C(180,150,70):MUTED);
+        SDL_Rect pc={PAD+10,iy+27,LIST_W-PAD*2-36,14}; dtclip(pt,pc,fSM,is_sel?C(180,150,70):MUTED);
         /* out-of-stock dot */
         if(!prods[pi].in_stock){
             SDL_SetRenderDrawBlendMode(gren,SDL_BLENDMODE_BLEND);
             SDL_SetRenderDrawColor(gren,RED.r,RED.g,RED.b,200);
-            SDL_RenderFillRect(gren,&(SDL_Rect){LIST_W-16,iy+19,6,6});
+            SDL_RenderFillRect(gren,&(SDL_Rect){LIST_W-34,iy+22,6,6});
             SDL_SetRenderDrawBlendMode(gren,SDL_BLENDMODE_NONE);
+        }
+        /* per-row delete × */
+        {
+            SDL_Rect xr={LIST_W-24,iy+(ITEM_H-18)/2,18,18};
+            int lit=is_hov||is_sel;
+            fr(xr,lit?C(60,18,18):C(30,13,16));
+            dr(xr,lit?C(110,40,40):C(60,28,32));
+            dtctr("×",xr,fMD,lit?C(235,110,110):C(140,70,75));
         }
     }
     /* drag ghost */
@@ -2253,6 +2386,14 @@ static void handle(SDL_Event *e){
             for(int fi=0;fi<nf;fi++){
                 SDL_Rect ir={0,LIST_TOP+(fi-list_scroll)*ITEM_H,LIST_W,ITEM_H};
                 if(pin(ir,mx,my)){
+                    /* per-row delete × */
+                    SDL_Rect xr={LIST_W-24,ir.y+(ITEM_H-18)/2,18,18};
+                    if(pin(xr,mx,my)){
+                        int pi=filt[fi];
+                        f2p(sel);
+                        if(confirm_delete(prods[pi].name)) delete_at(pi);
+                        return;
+                    }
                     f2p(sel); sel=filt[fi]; p2f(sel); tf_off();
                     /* start drag tracking */
                     drag.held=1; drag.active=0;
@@ -2275,9 +2416,8 @@ static void handle(SDL_Event *e){
         /* delete */
         if(pin(btn_del,mx,my)&&np>0){
             f2p(sel);
-            memmove(&prods[sel],&prods[sel+1],(np-sel-1)*sizeof(Prod));
-            np--; if(sel>=np&&sel>0) sel--;
-            if(np>0) p2f(sel); else img_free(); dirty=1; apply_filter(); return;
+            if(confirm_delete(prods[sel].name)) delete_at(sel);
+            return;
         }
         /* brand dropdown pick */
         if(brand_dd && nb>0){
@@ -2486,11 +2626,12 @@ int main(void){
     pthread_detach(wt);
 
     /* ── pull latest from GitHub before loading ── */
-    system("cd /home/xmm/Projects/perfume-store && git fetch origin && git checkout origin/main -- index.html 2>/dev/null");
+    system("cd /home/xmm/Projects/perfume-store && git fetch origin && git checkout origin/main -- index.html data.json 2>/dev/null");
 
     /* ── layout + load ── */
     layout();
     html_load();
+    data_json_fill_images();   /* index.html has image:null after Android pushes */
     if(np>0) p2f(0);
 
     /* ── main loop ── */
