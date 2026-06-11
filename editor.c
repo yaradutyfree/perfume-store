@@ -27,6 +27,9 @@
 #define HTML_PATH  "/home/xmm/Projects/perfume-store/index.html"
 #define IMG_DIR    "/home/xmm/Projects/perfume-store/images"
 #define GIT_DIR    "/home/xmm/Projects/perfume-store"
+#define FB_DB      "https://yaradutyfree-a7751-default-rtdb.firebaseio.com"
+#define GH_RAW     "https://raw.githubusercontent.com/yaradutyfree/perfume-store/main"
+#define GH_REPO    "yaradutyfree/perfume-store"
 #define FONT_PATH  "/usr/share/fonts/truetype/lato/Lato-Regular.ttf"
 #define WS_HOST    "perfume-store-ssls.onrender.com"
 #define WS_PORT    443
@@ -523,37 +526,60 @@ static void *ws_thread(void *arg){
 
 static const char B64T[]="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 static void write_img_b64(FILE *out, const char *relpath); /* defined later */
+static void fj(FILE *out, const char *s);                  /* defined later */
 
-static void ws_send_products(void){
-    if(ws_state != WS_READY){ set_st("WebSocket not connected yet"); return; }
-    /* build JSON with full base64 images into a dynamic buffer */
-    char *buf = NULL; size_t bsz = 0;
-    FILE *out = open_memstream(&buf, &bsz);
-    if(!out){ set_st("ERROR: open_memstream failed"); return; }
-    fprintf(out,"{\"type\":\"update_products\",\"secret\":\"%s\",\"products\":[",WS_SECRET);
+/* Convert a local image path to a raw GitHub URL for use in index.html / Firebase.
+   "images/prod_26486.jpg" → "https://raw.githubusercontent.com/.../images/prod_26486.jpg"
+   A URL that already starts with http is passed through unchanged. */
+static void img_to_raw_url(const char *local, char *out, int sz){
+    if(!local||!local[0]){ out[0]=0; return; }
+    if(strncmp(local,"http",4)==0){ snprintf(out,sz,"%s",local); return; }
+    if(strncmp(local,"images/",7)==0)
+        snprintf(out,sz,"%s/%s",GH_RAW,local);
+    else
+        snprintf(out,sz,"%s",local);
+}
+
+static void firebase_sync(void){
+    set_st("Syncing to Firebase...");
+    char *buf=NULL; size_t bsz=0;
+    FILE *out=open_memstream(&buf,&bsz);
+    if(!out){ set_st("ERROR: open_memstream"); return; }
+    fputs("{\"products\":[",out);
     for(int i=0;i<np;i++){
         Prod *p=&prods[i];
-        char bj[80],brj[80],spj[40];
-        if(p->badge[0]) snprintf(bj,sizeof(bj),"\"%s\"",p->badge); else strcpy(bj,"null");
-        if(p->brand[0]) snprintf(brj,sizeof(brj),"\"%s\"",p->brand); else strcpy(brj,"null");
+        char spj[40], imgurl[512];
         if(p->sale_price[0]) snprintf(spj,sizeof(spj),"%s",p->sale_price); else strcpy(spj,"null");
-        fprintf(out,"{\"id\":%d,\"name\":\"%s\",\"desc\":\"%s\","
-            "\"price\":%s,\"size\":\"%s\",\"icon\":\"%s\","
-            "\"badge\":%s,\"brand\":%s,\"inStock\":%s,\"salePrice\":%s,\"image\":",
-            p->id,p->name,p->desc,
-            p->price[0]?p->price:"0",
-            p->size,p->icon[0]?p->icon:"🌹",
-            bj,brj,p->in_stock?"true":"false",spj);
-        if(p->image[0]) write_img_b64(out,p->image); else fputs("null",out);
-        fprintf(out,"}%s",i<np-1?",":"");
+        img_to_raw_url(p->image, imgurl, sizeof(imgurl));
+        fprintf(out,"{\"id\":%d,",p->id);
+        fputs("\"name\":",out);    fj(out,p->name);
+        fputs(",\"desc\":",out);   fj(out,p->desc);
+        fprintf(out,",\"price\":%s,",p->price[0]?p->price:"0");
+        fputs("\"size\":",out);    fj(out,p->size[0]?p->size:"100ml");
+        fputs(",\"icon\":",out);   fj(out,p->icon[0]?p->icon:"🌹");
+        fputs(",\"badge\":",out);  p->badge[0]?fj(out,p->badge):fputs("null",out);
+        if(imgurl[0]){ fputs(",\"image\":",out); fj(out,imgurl); }
+        else fputs(",\"image\":null",out);
+        fputs(",\"brand\":",out);  p->brand[0]?fj(out,p->brand):fputs("null",out);
+        fprintf(out,",\"inStock\":%s,\"salePrice\":%s}%s",
+            p->in_stock?"true":"false", spj, i<np-1?",":"");
     }
     fputs("],\"brands\":[",out);
-    for(int i=0;i<nb;i++) fprintf(out,"\"%s\"%s",brands[i],i<nb-1?",":"");
+    for(int i=0;i<nb;i++){ fj(out,brands[i]); if(i<nb-1) fputc(',',out); }
     fputs("]}",out);
     fclose(out);
-    wsq_push(buf);
-    free(buf);
-    set_st("Syncing products to live website...");
+
+    const char *tmp="/tmp/ydf_firebase.json";
+    FILE *tf=fopen(tmp,"wb");
+    if(!tf){ free(buf); set_st("ERROR: cannot write temp file"); return; }
+    fwrite(buf,1,bsz,tf); fclose(tf); free(buf);
+
+    char cmd[512];
+    snprintf(cmd,sizeof(cmd),
+        "curl -s -X PUT -H 'Content-Type: application/json' --data @%s '%s/store.json' >/dev/null 2>&1",
+        tmp, FB_DB);
+    int r=system(cmd);
+    set_st(r==0?"Synced to Firebase!":"ERROR: Firebase sync failed (check internet)");
 }
 
 static size_t b64_to_file(const char*,size_t,const char*); /* forward decl */
@@ -718,6 +744,12 @@ static void html_load(void){
         exfield(blk,"salePrice", pr->sale_price, sizeof(pr->sale_price));
         if(!strcmp(pr->badge,"null"))      pr->badge[0]=0;
         if(!strcmp(pr->image,"null"))      pr->image[0]=0;
+        /* raw GitHub URL → extract local path "images/prod_<id>.<ext>" */
+        if(strncmp(pr->image,"https://raw.githubusercontent.com/",34)==0){
+            const char *lp=strstr(pr->image,"images/prod_");
+            if(lp) snprintf(pr->image,sizeof(pr->image),"%s",lp);
+            else pr->image[0]=0;
+        }
         /* if image is a base64 data URL, decode to local file */
         if(strncmp(pr->image,"data:",5)==0){
             char *b64full=exfield_big(blk,"image");
@@ -782,7 +814,7 @@ static void html_save(void){
         Prod *p=&prods[i];
         char bj[80],ij[300],brj[80],spj[40];
         if(p->badge[0])      snprintf(bj, sizeof(bj), "\"%s\"",p->badge); else strcpy(bj,"null");
-        if(p->image[0])      snprintf(ij, sizeof(ij), "\"%s\"",p->image); else strcpy(ij,"null");
+        if(p->image[0]){ char raw[512]; img_to_raw_url(p->image,raw,sizeof(raw)); snprintf(ij,sizeof(ij),"\"%s\"",raw); } else strcpy(ij,"null");
         if(p->brand[0])      snprintf(brj,sizeof(brj),"\"%s\"",p->brand); else strcpy(brj,"null");
         if(p->sale_price[0]) snprintf(spj,sizeof(spj),"%s",    p->sale_price); else strcpy(spj,"null");
         pos+=snprintf(njs+pos,BUF_MAX-pos,
@@ -900,15 +932,26 @@ static void data_json_save(void){
 static void git_push(void){
     set_st("Pushing to GitHub...");
     data_json_save(); /* keep data.json in sync for Android app */
-    char cmd[512];
+    char cmd[600];
+    /* pull --rebase first so we never get a non-fast-forward rejection */
     snprintf(cmd,sizeof(cmd),
-        "cd %s && git add -A && git commit -m 'Update products' && git push 2>&1",GIT_DIR);
+        "cd %s && git add -A && git commit -m 'Update products' ; "
+        "git pull --rebase origin main 2>&1 && git push 2>&1",GIT_DIR);
     FILE *fp=popen(cmd,"r"); if(!fp){ set_st("ERROR: popen failed"); return; }
     char line[256],last[256]={0};
-    while(fgets(line,sizeof(line),fp)) strncpy(last,line,255);
-    pclose(fp);
+    int pushed=0;
+    while(fgets(line,sizeof(line),fp)){
+        strncpy(last,line,255);
+        if(strstr(line,"main -> main")||strstr(line,"up-to-date")) pushed=1;
+    }
+    int rc=pclose(fp);
     int l=strlen(last); while(l>0&&(last[l-1]=='\n'||last[l-1]=='\r')) last[--l]=0;
-    set_st(last[0]?last:"Pushed to GitHub!");
+    if(rc!=0||strstr(last,"error")||strstr(last,"rejected")){
+        char msg[320]; snprintf(msg,sizeof(msg),"Push FAILED: %s",last);
+        set_st(msg); return; /* do NOT firebase_sync on failure */
+    }
+    set_st(l?"Pushed!":"Pushed to GitHub!");
+    firebase_sync();
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -1512,7 +1555,14 @@ static void data_json_fill_images(void){
         char tmp[32]={0}; jstr(blk,"id",tmp,sizeof(tmp));
         int id=atoi(tmp);
         for(int i=0;i<np;i++){
-            if(prods[i].id!=id||prods[i].image[0]) continue;
+            if(prods[i].id!=id) continue;
+            /* skip only if image field is set AND the local file exists */
+            if(prods[i].image[0]){
+                char fpath[512];
+                snprintf(fpath,sizeof(fpath),"%s/%s",GIT_DIR,prods[i].image);
+                if(access(fpath,F_OK)==0) continue;
+                prods[i].image[0]=0; /* file missing — re-decode */
+            }
             char *imgval=jfield_big(blk,"image");
             if(imgval&&strncmp(imgval,"data:",5)==0){
                 const char *b64=strstr(imgval,"base64,");
@@ -1530,9 +1580,23 @@ static void data_json_fill_images(void){
                         filled++;
                     }
                 }
-            } else if(imgval&&imgval[0]){
-                strncpy(prods[i].image,imgval,255);
-                filled++;
+            } else if(imgval&&strncmp(imgval,"https://raw.",12)==0){
+                /* raw GitHub URL — download to local file if not cached */
+                const char *fn=strrchr(imgval,'/');
+                if(fn){ fn++;
+                    const char *dot=strrchr(fn,'.'); const char *ext=dot?dot+1:"jpg";
+                    char lpath[512];
+                    snprintf(lpath,sizeof(lpath),"%s/prod_%d.%s",IMG_DIR,id,ext);
+                    if(access(lpath,F_OK)!=0){
+                        char cmd[768];
+                        snprintf(cmd,sizeof(cmd),"curl -sL '%s' -o '%s' 2>/dev/null",imgval,lpath);
+                        system(cmd);
+                    }
+                    if(access(lpath,F_OK)==0){
+                        snprintf(prods[i].image,sizeof(prods[i].image),"images/prod_%d.%s",id,ext);
+                        filled++;
+                    }
+                }
             }
             free(imgval);
             break;
@@ -1560,7 +1624,7 @@ static void data_json_fill_images(void){
 
     if(filled){
         char msg[96];
-        snprintf(msg,sizeof(msg),"Loaded %d products, %d brands — %d images from data.json",np,nb,filled);
+        snprintf(msg,sizeof(msg),"Loaded %d products, %d brands — %d images",np,nb,filled);
         set_st(msg);
     }
 }
@@ -2452,14 +2516,14 @@ static void handle(SDL_Event *e){
         if(pin(btn_browse,mx,my)){ f2p(sel); tf_off(); fb_open_browser(); return; }
         /* paste */
         if(pin(btn_paste,mx,my)){ f2p(sel); tf_off(); paste_clip(); return; }
-        if(pin(btn_wssync, mx,my)){ f2p(sel); ws_send_products(); return; }
+        if(pin(btn_wssync, mx,my)){ f2p(sel); firebase_sync(); return; }
         if(pin(btn_reconnect,mx,my)){ ws_force_reconnect=1; set_st("Reconnecting..."); return; }
         /* history */
         if(pin(btn_history,mx,my)){ hist.open=!hist.open; if(hist.open) load_hist(); return; }
         /* save */
         if(pin(btn_save,mx,my)){ f2p(sel); html_save(); return; }
         /* push */
-        if(pin(btn_push,mx,my)){ f2p(sel); html_save(); git_push(); ws_send_products(); return; }
+        if(pin(btn_push,mx,my)){ f2p(sel); html_save(); git_push(); return; }
 
         tf_off(); return;
     }
