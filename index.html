@@ -643,7 +643,7 @@
   const WHATSAPP_NUMBER = "573144613936";
   const STORE_NAME      = "YaraDutyFree";
   const CURRENCY        = "$";
-  const WS_URL          = "wss://perfume-store-ssls.onrender.com";
+  const FB_DB = "https://yaradutyfree-a7751-default-rtdb.firebaseio.com";
 
   /* ── Brands ── */
   let brands = [
@@ -1954,23 +1954,34 @@
     localStorage.setItem('ydf_theme', isDark ? 'dark' : 'light');
   }
 
-  /* ── WebSocket ── */
-  let ws = null, wsDelay = 2000;
-  function wsConnect() {
-    try { ws = new WebSocket(WS_URL); } catch(e) { setTimeout(wsConnect, wsDelay); return; }
-    ws.onopen  = () => { setDot('conn', 'Conectado'); wsDelay = 2000; };
-    ws.onmessage = e => {
+  /* ── Firebase EventSource ── */
+  let fbEs = null;
+  function fbConnect() {
+    if (fbEs) { fbEs.close(); fbEs = null; }
+    fbEs = new EventSource(FB_DB + '/store.json?stream');
+    fbEs.addEventListener('put', e => {
       try {
-        const m = JSON.parse(e.data);
-        if (m.type === 'products' || m.type === 'state') {
-          if (Array.isArray(m.products) && m.products.length) products = m.products;
-          if (Array.isArray(m.brands) && m.brands.length) brands = m.brands;
-          renderFolders(); 
-        }
-      } catch(e2) {}
-    };
-    ws.onclose = () => { setDot('', 'Desconectado'); setTimeout(wsConnect, wsDelay = Math.min(wsDelay * 1.5, 30000)); };
-    ws.onerror = () => {  };
+        const d = JSON.parse(e.data);
+        const data = d.path === '/' ? d.data
+                   : d.path === '/products' ? { products: d.data }
+                   : d.path === '/brands'   ? { brands: d.data }
+                   : null;
+        if (!data) return;
+        if (Array.isArray(data.products) && data.products.length) products = data.products;
+        if (Array.isArray(data.brands)   && data.brands.length)   brands   = data.brands;
+        renderFolders();
+      } catch(err) {}
+    });
+    fbEs.addEventListener('patch', e => {
+      try {
+        const d = JSON.parse(e.data);
+        if (!d.data) return;
+        if (Array.isArray(d.data.products) && d.data.products.length) products = d.data.products;
+        if (Array.isArray(d.data.brands)   && d.data.brands.length)   brands   = d.data.brands;
+        renderFolders();
+      } catch(err) {}
+    });
+    fbEs.onerror = () => { fbEs.close(); fbEs = null; setTimeout(fbConnect, 5000); };
   }
 
   /* ── Init ── */
@@ -1979,7 +1990,7 @@
     document.getElementById('themeBtn').textContent = '☀️';
   }
   renderFolders();
-  wsConnect();
+  fbConnect();
 
   /* fullscreen on first touch (mobile) */
   function tryFullscreen() {
