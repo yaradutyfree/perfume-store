@@ -68,13 +68,8 @@
     .logo-tagline { font-size:.57rem; letter-spacing:.22em; color:rgba(255,255,255,.75); text-transform:uppercase; margin-top:3px; }
     .logo-orn { height:1px; margin-top:5px; background:linear-gradient(90deg,transparent,rgba(255,255,255,.6),transparent); }
     .header-right { display:flex; align-items:center; gap:12px; }
-    .ws-status { display:flex; align-items:center; gap:5px; }
-    .ws-dot { width:7px; height:7px; border-radius:50%; background:#FF6B6B; transition:background .6s;
       box-shadow:0 0 6px rgba(255,107,107,.8); }
-    .ws-dot.live { background:#50E080; box-shadow:0 0 8px rgba(80,224,128,.9); animation:blink 2.5s infinite; }
-    .ws-dot.conn { background:#FFD060; box-shadow:0 0 6px rgba(255,208,96,.8); }
     @keyframes blink { 0%,100%{opacity:1} 50%{opacity:.35} }
-    .ws-label { font-size:.62rem; color:rgba(255,255,255,.80); letter-spacing:.06em; }
     .icon-btn {
       background:rgba(255,255,255,.15); border:1px solid rgba(255,255,255,.35); color:#fff;
       width:32px; height:32px; cursor:pointer; font-size:14px; border-radius:4px;
@@ -447,7 +442,6 @@
       .logo-name { font-size:1.05rem; letter-spacing:.05em; }
       .logo-tagline { display:none; }
       .logo-orn { display:none; }
-      .ws-label { display:none; }
       /* hide cart text, show only icon + count */
       .cart-toggle { padding:7px 10px; font-size:0; gap:4px; letter-spacing:0; border-radius:20px; }
       .cart-toggle::before { content:'🛒'; font-size:15px; }
@@ -557,10 +551,6 @@
       <div class="logo-orn"></div>
     </div>
     <div class="header-right">
-      <div class="ws-status">
-        <div class="ws-dot" id="wsDot"></div>
-        <span class="ws-label" id="wsLabel">Conectando…</span>
-      </div>
       <button class="icon-btn" id="themeBtn" onclick="toggleTheme()" title="Modo claro/oscuro">☀️</button>
       <button class="cart-toggle" onclick="toggleCart()">
         <span>🛍</span><span>Carrito</span>
@@ -1975,17 +1965,12 @@
         if (m.type === 'products' || m.type === 'state') {
           if (Array.isArray(m.products) && m.products.length) products = m.products;
           if (Array.isArray(m.brands) && m.brands.length) brands = m.brands;
-          renderFolders(); setDot('live', 'En vivo');
+          renderFolders(); 
         }
       } catch(e2) {}
     };
     ws.onclose = () => { setDot('', 'Desconectado'); setTimeout(wsConnect, wsDelay = Math.min(wsDelay * 1.5, 30000)); };
-    ws.onerror = () => { setDot('', 'Sin conexión'); };
-  }
-  function setDot(cls, lbl) {
-    const d = document.getElementById('wsDot'), l = document.getElementById('wsLabel');
-    d.className = 'ws-dot ' + cls; l.textContent = lbl;
-    l.style.color = cls === 'live' ? 'var(--green)' : cls === 'conn' ? 'var(--gold)' : 'var(--muted)';
+    ws.onerror = () => {  };
   }
 
   /* ── Init ── */
