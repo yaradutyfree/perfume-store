@@ -245,6 +245,7 @@
     .chunk-oos-text { color:#C02040; font-size:.38rem; font-weight:700; letter-spacing:.2em; text-transform:uppercase; border:1px solid #C02040; padding:2px 5px; border-radius:2px; }
     .chunk-price { font-size:.62rem; color:var(--rose-dk); font-weight:700; letter-spacing:.04em; }
     .chunk-price.sale { color:#C02848; }
+    .chunk-badge { position:absolute; top:-5px; right:-5px; background:#C02848; color:#fff; font-size:.48rem; font-weight:800; padding:2px 5px; border-radius:8px; white-space:nowrap; letter-spacing:.03em; z-index:2; box-shadow:0 1px 4px rgba(0,0,0,.4); }
 
     /* ── No results ── */
     .no-results { text-align:center; padding:60px 24px; color:var(--muted); font-style:italic; }
@@ -1731,9 +1732,13 @@
         : '';
       const priceVal = p.salePrice ? p.salePrice : p.price;
       const priceClass = p.salePrice ? 'chunk-price sale' : 'chunk-price';
+      const discPct = (p.salePrice && Number(p.price) > 0)
+        ? Math.round((1 - Number(p.salePrice) / Number(p.price)) * 100) : 0;
+      const badgeTxt = p.badge || (discPct >= 5 ? `-${discPct}%` : '');
+      const badgeH = badgeTxt ? `<div class="chunk-badge">${badgeTxt}</div>` : '';
       return `<div class="perf-chunk" onclick="showDetail(${p.id})">
         <div class="chunk-name">${p.name}</div>
-        <div class="chunk-circle">${circContent}${oosH}</div>
+        <div class="chunk-circle">${circContent}${oosH}${badgeH}</div>
         <div class="${priceClass}">${CURRENCY}${Number(priceVal).toLocaleString('es-CO')}</div>
       </div>`;
     }).join('');
