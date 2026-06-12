@@ -2516,7 +2516,18 @@ static void handle(SDL_Event *e){
         if(pin(btn_browse,mx,my)){ f2p(sel); tf_off(); fb_open_browser(); return; }
         /* paste */
         if(pin(btn_paste,mx,my)){ f2p(sel); tf_off(); paste_clip(); return; }
-        if(pin(btn_wssync, mx,my)){ f2p(sel); firebase_sync(); return; }
+        if(pin(btn_wssync, mx,my)){
+            /* refuse sync if there are uncommitted files — images not on GitHub yet */
+            char chk[256];
+            snprintf(chk,sizeof(chk),"cd %s && git status --porcelain 2>/dev/null | head -1",GIT_DIR);
+            FILE *gf=popen(chk,"r"); char gline[64]={0};
+            if(gf){ fgets(gline,sizeof(gline),gf); pclose(gf); }
+            if(gline[0]){
+                set_st("Uncommitted changes — use Push first to upload images, then Sync");
+                return;
+            }
+            f2p(sel); firebase_sync(); return;
+        }
         if(pin(btn_reconnect,mx,my)){ ws_force_reconnect=1; set_st("Reconnecting..."); return; }
         /* history */
         if(pin(btn_history,mx,my)){ hist.open=!hist.open; if(hist.open) load_hist(); return; }
